@@ -43,7 +43,13 @@ import {MODULE_PARAMETERS} from "../natives/nodejs";
  * See https://babeljs.io/docs/en/babel-plugin-transform-typescript/#caveats
  * and https://www.typescriptlang.org/docs/handbook/modules.html#export--and-import--require
  */
-export function replaceTypeScriptImportExportAssignmentsAndAddConstructors({ template }: {template: TemplateBuilder<TSExportAssignment>}): PluginObj {
+/**
+ * @param options.faithfulImplicitConstructor if true, synthesized implicit constructors
+ *   forward arguments faithfully (required for
+ *   instrumented execution); if false (default) use fixed positional for better positional precision (for static analysis).
+ */
+export function replaceTypeScriptImportExportAssignmentsAndAddConstructors({ template }: {template: TemplateBuilder<TSExportAssignment>}, options?: {faithfulImplicitConstructor?: boolean}): PluginObj {
+    const faithfulImplicitConstructor = options?.faithfulImplicitConstructor ?? false;
     const moduleExportsDeclaration = template("module.exports = ASSIGNMENT;");
     const moduleImportsDeclaration = template("var ID = require(MODULE);");
     return {
@@ -69,22 +75,27 @@ export function replaceTypeScriptImportExportAssignmentsAndAddConstructors({ tem
                         return;
                 let params: Array<Identifier | RestElement>, body: BlockStatement;
                 if (path.node.superClass) {
-                    params = [
-                        identifier("p1"),
-                        identifier("p2"),
-                        identifier("p3"),
-                        identifier("p4"),
-                        identifier("p5"),
-                        restElement(identifier("rest"))
-                    ];
-                    body = blockStatement([expressionStatement(callExpression(_super(), [
-                        identifier("p1"),
-                        identifier("p2"),
-                        identifier("p3"),
-                        identifier("p4"),
-                        identifier("p5"),
-                        spreadElement(identifier("rest"))
-                    ]))]);
+                    if (faithfulImplicitConstructor) {
+                        params = [restElement(identifier("rest"))];
+                        body = blockStatement([expressionStatement(callExpression(_super(), [spreadElement(identifier("rest"))]))]);
+                    } else {
+                        params = [
+                            identifier("p1"),
+                            identifier("p2"),
+                            identifier("p3"),
+                            identifier("p4"),
+                            identifier("p5"),
+                            restElement(identifier("rest"))
+                        ];
+                        body = blockStatement([expressionStatement(callExpression(_super(), [
+                            identifier("p1"),
+                            identifier("p2"),
+                            identifier("p3"),
+                            identifier("p4"),
+                            identifier("p5"),
+                            spreadElement(identifier("rest"))
+                        ]))]);
+                    }
                 } else {
                     params = [];
                     body = blockStatement([]);

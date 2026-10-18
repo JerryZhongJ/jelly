@@ -8,7 +8,7 @@ import {nodejsModels} from "./nodejs";
 import {options} from "../options";
 import logger from "../misc/logger";
 import {Operations} from "../analysis/operations";
-import {ObjectPropertyVarObj} from "../analysis/constraintvars";
+import {ConstraintVar, ObjectPropertyVarObj} from "../analysis/constraintvars";
 
 export type CallNodePath = NodePath<CallExpression | OptionalCallExpression | NewExpression>;
 
@@ -27,6 +27,10 @@ export type NativeFunctionParams = NativeModelParams & {
     op: Operations,
     path: NodePath<Expression>,
     callArgs: CallExpression["arguments"],
+    // Values of every `callArgs` entry at or after the first SpreadElement,
+    // merged with unknown position. Handlers should consult `callArgs` only
+    // up to the first SpreadElement.
+    tailVar?: ConstraintVar,
 };
 
 export type NativeFunctionAnalyzer = (p: NativeFunctionParams) => void;

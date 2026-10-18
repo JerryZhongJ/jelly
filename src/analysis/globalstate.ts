@@ -32,6 +32,7 @@ import {TypeLabel, TypeLabelRegistry} from "./typelabels";
 import {getEnclosingFunction} from "../misc/asthelpers";
 import {Worklist} from "../misc/worklist";
 import {locKeyFromNode} from "./callEdgePriors";
+import {DefUse} from "../cfg/defuse";
 
 /**
  * Global analysis state.
@@ -146,6 +147,11 @@ export class GlobalState {
      * Map from module name to ModuleInfo.
      */
     readonly moduleInfos: Map<string, ModuleInfo> = new Map;
+
+    /**
+     * Def-use information for each module (unless --no-def-use).
+     */
+    readonly defUse: Map<ModuleInfo, DefUse> = new Map;
 
     /**
      * Set of DummyModuleInfos created (for module files that haven't been found).

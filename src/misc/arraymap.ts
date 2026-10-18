@@ -63,6 +63,26 @@ export class ArrayMapSet<KS, K extends Indexed & KS, V> extends ArrayMap<KS, K, 
     }
 }
 
+export class ArrayMapArray<KS, K extends Indexed & KS, V> extends ArrayMap<KS, K, Array<V>> {
+
+    getArray(k: K): Array<V> {
+        let a = this.get(k);
+        if (a === undefined) {
+            a = [];
+            this.set(k, a);
+        }
+        return a;
+    }
+
+    totalSize(): number {
+        let s = 0;
+        for (const a of this.a.values())
+            if (a !== undefined)
+                s += a.length;
+        return s;
+    }
+}
+
 export class ArrayMapMap<KS, K1 extends Indexed & KS, K2, V> extends ArrayMap<KS, K1, Map<K2, V>> {
 
     getMap(k: K1): Map<K2, V> {

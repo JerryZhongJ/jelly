@@ -2,7 +2,7 @@ import {FunctionInfo, ModuleInfo, PackageInfo} from "../analysis/infos";
 import logger from "../misc/logger";
 import {options} from "../options";
 import {writeSync} from "fs";
-import {locationToString} from "../misc/util";
+import {escapeDot, locationToString} from "../misc/util";
 import {FragmentState} from "../analysis/fragmentstate";
 
 // TODO: optionally mark reachable packages/modules/functions
@@ -28,10 +28,6 @@ export function toDot(f: FragmentState, fd: number = process.stdout.fd) {
         return t;
     }
 
-    function esc(s: string): string {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
-    }
-
     function ind(i: number): string {
         return " ".repeat(i);
     }
@@ -52,7 +48,7 @@ export function toDot(f: FragmentState, fd: number = process.stdout.fd) {
 
     function writeModule(km: string, m: ModuleInfo, i: number) {
         writeSync(fd, `${ind(i)}subgraph cluster${id(m)} {\n` +
-            `${ind(i)} label=\"${esc(km)}\";\n` +
+            `${ind(i)} label=\"${escapeDot(km)}\";\n` +
             `${ind(i)} bgcolor=\"#ffffff\";\n` +
             `${ind(i)}node${id(m)}[style=invis,shape=point];\n`);
         for (const f of m.functions)
@@ -71,7 +67,7 @@ export function toDot(f: FragmentState, fd: number = process.stdout.fd) {
     for (const [kp, p] of f.a.packageInfos)
         if (isPackageIncluded(p)) {
             writeSync(fd, ` subgraph cluster${id(p)} {\n` +
-                `  label=\"${esc(kp)}\";\n` +
+                `  label=\"${escapeDot(kp)}\";\n` +
                 "  bgcolor=\"#f0f0f0\";\n");
             for (const [km, m] of p.modules)
                 writeModule(km, m, 2);

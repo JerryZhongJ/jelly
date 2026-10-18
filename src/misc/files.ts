@@ -88,10 +88,10 @@ function* expandRec(path: string, sub: boolean, visited: Set<string>): Generator
             (path.endsWith(".js") || path.endsWith(".es") || path.endsWith(".mjs") || path.endsWith(".cjs") ||
                 (!inNodeModules && (
                     /* include files with these extensions if not inside node_modules */
-                    path.endsWith(".jsx") || path.endsWith(".ts") || path.endsWith(".tsx") || path.endsWith(".mts") || path.endsWith(".cts") ||
-                    /* include shebang files if not inside node_modules */
-                    isShebang(path)
-                ))))
+                    path.endsWith(".jsx") || path.endsWith(".ts") || path.endsWith(".tsx") || path.endsWith(".mts") || path.endsWith(".cts")
+                )) ||
+                /* include shebang files (only probe extension-less files inside node_modules) */
+                ((!inNodeModules || extname(path) === "") && isShebang(path))))
             yield relative(options.basedir, path);
         else
             (sub ? logger.debug : logger.warn)(`Skipping file ${path}, doesn't look like a JavaScript/TypeScript file`);

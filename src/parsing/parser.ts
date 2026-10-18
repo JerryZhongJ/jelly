@@ -10,7 +10,7 @@ const transformOptions = [false, true].map((fragmentStateDefined) =>
     loadOptions({
         cloneInputAst: false,
         plugins: [
-            replaceTypeScriptImportExportAssignmentsAndAddConstructors,
+            [replaceTypeScriptImportExportAssignmentsAndAddConstructors, {faithfulImplicitConstructor: !fragmentStateDefined}],
             ['@babel/plugin-transform-typescript', {
                 onlyRemoveTypeImports: fragmentStateDefined,
                 allowDeclareFields: fragmentStateDefined,

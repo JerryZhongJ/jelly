@@ -120,7 +120,8 @@ export default class Solver {
         d.functions = a.functionInfos.size;
         d.vars = f.getNumberOfVarsWithTokens();
         d.listeners = f.tokenListeners.totalSize() + f.tokenListeners2.totalSize() +
-            f.arrayEntriesListeners.totalSize() + f.objectPropertiesListeners.totalSize();
+            f.arrayEntriesListeners.totalSize() + f.objectPropertiesListeners.totalSize() +
+            f.nonEmptyListeners.totalSize();
         d.tokens = f.numberOfTokens;
         d.subsetEdges = f.numberOfSubsetEdges;
         d.functionToFunctionEdges = f.numberOfFunctionToFunctionEdges;
@@ -154,6 +155,16 @@ export default class Solver {
      */
     private enqueueListenerCall2(la: PostponedListenerCall) {
         this.fragmentState.postponedListenerCalls2.push(la);
+    }
+
+    /**
+     * Enqueues a call to a nonempty-listener (registered via 'addIfNonEmptyConstraint').
+     * The call is postponed rather than executed inline so that the listener does not run in the middle of
+     * token propagation (where it could re-enter 'addToken' and corrupt the worklist).
+     */
+    private enqueueIfNonEmptyListener(listener: () => void) {
+        this.enqueueListenerCall([listener, undefined]);
+        this.diagnostics.nonEmptyListenerNotifications++;
     }
 
     /**
@@ -198,9 +209,11 @@ export default class Solver {
             assert(!this.fragmentState.redirections.has(toRep));
             assert(!this.isIgnoredVar(toRep));
         }
+        // notify nonempty-listeners (toRep was empty before this token was added if it has any such listeners)
+        this.callIfNonEmptyListeners(toRep);
+        // add to worklist
         if (!ws)
             ws = this.unprocessedTokens.get(toRep);
-        // add to worklist
         ws = pushArraySingle(this.unprocessedTokens, toRep, t, ws);
         this.diagnostics.unprocessedTokensSize++;
         if (this.diagnostics.unprocessedTokensSize % 100 === 0)
@@ -398,6 +411,30 @@ export default class Solver {
     }
 
     /**
+     * Adds a constraint that postpones execution of the given listener until the given constraint variable becomes nonempty.
+     * If the variable is already nonempty, the listener is executed immediately, and otherwise it is executed (at most once)
+     * when the first token is added to the variable.
+     * This is cheaper than registering an 'addForAllTokensConstraint' listener eagerly when the variable is usually empty,
+     * the intended use being to register the actual (more expensive) constraints lazily inside the listener.
+     */
+    addIfNonEmptyConstraint(v: ConstraintVar | undefined, listener: () => void) {
+        if (v === undefined)
+            return;
+        const f = this.fragmentState;
+        const vRep = f.getRepresentative(v);
+        if (this.isIgnoredVar(vRep))
+            return;
+        if (!f.isEmpty(vRep)) {
+            // already nonempty: enqueue listener call
+            this.enqueueIfNonEmptyListener(listener);
+        } else {
+            // register listener for when the variable becomes nonempty
+            f.nonEmptyListeners.getArray(vRep).push(listener);
+            f.vars.add(vRep);
+        }
+    }
+
+    /**
      * Enqueues a call to a (non-bounded) token listener if it hasn't been done before.
      */
     private callTokenListener(id: ListenerID, listener: (t: Token) => void, t: Token, now?: boolean) {
@@ -422,6 +459,18 @@ export default class Solver {
             s.add(t);
             this.enqueueListenerCall2([listener, t]);
             this.diagnostics.tokenListener2Notifications++;
+        }
+    }
+
+    /**
+     * Enqueues and removes the nonempty-listeners (if any) registered via 'addIfNonEmptyConstraint' for the given constraint variable.
+     */
+    private callIfNonEmptyListeners(v: RepresentativeVar) {
+        const ls = this.fragmentState.nonEmptyListeners.get(v);
+        if (ls) {
+            this.fragmentState.nonEmptyListeners.delete(v);
+            for (const listener of ls)
+                this.enqueueIfNonEmptyListener(listener);
         }
     }
 
@@ -495,10 +544,10 @@ export default class Solver {
      * Adds a quantified constraint for all explicit numeric properties of the given array.
      * The triple consisting of the token, the key, and the node must together uniquely determine the function (including its free variables).
      */
-    addForAllArrayEntriesConstraint(t: ArrayToken, key: TokenListener, n: Node, listener: (prop: string) => void) {
+    addForAllArrayEntriesConstraint(t: ArrayToken, key: TokenListener, opts: Node | Omit<ListenerKey, "l">, listener: (prop: string) => void) {
         if (logger.isDebugEnabled())
             logger.debug(`Adding array entries constraint #${TokenListener[key]} to ${t}`);
-        const id = this.getListenerID({l: key, n});
+        const id = this.getListenerID(isNode(opts) ? {l: key, n: opts} : {...opts, l: key});
         const m = this.runArrayEntriesListener(t, id, listener);
         if (m) {
             // register listener for future entries
@@ -733,6 +782,18 @@ export default class Solver {
                         this.callTokenListener2(k, listener, t);
                 }
             f.tokenListeners2.delete(v);
+        }
+        // redirect nonempty-listeners; v is empty (otherwise its listeners would already have been invoked and removed),
+        // so the merged variable is nonempty iff rep is nonempty
+        const nr = f.nonEmptyListeners.get(v);
+        if (nr) {
+            if (f.isEmpty(rep))
+                for (const listener of nr)
+                    f.nonEmptyListeners.getArray(rep).push(listener);
+            else
+                for (const listener of nr)
+                    this.enqueueIfNonEmptyListener(listener);
+            f.nonEmptyListeners.delete(v);
         }
         assert(!this.unprocessedTokens.has(v));
         f.vars.delete(v);

@@ -7,6 +7,8 @@ import {
     isIdentifier,
     isObjectExpression,
     isObjectProperty,
+    isRestElement,
+    isSpreadElement,
 } from "@babel/types";
 import {
     AccessPathToken,
@@ -54,7 +56,7 @@ export function assignParameterToThisProperty(param: number, prop: string, p: Na
 /**
  * Assigns from the given expression to an unknown entry of the given array object.
  */
-function assignExpressionToArrayValue(from: Expression, t: ArrayToken, p: NativeFunctionParams) {
+export function assignExpressionToArrayValue(from: Expression, t: ArrayToken, p: NativeFunctionParams) {
     const argVar = p.solver.varProducer.expVar(from, p.path);
     if (argVar)
         p.solver.addSubsetConstraint(argVar, p.solver.varProducer.arrayUnknownVar(t));
@@ -80,6 +82,36 @@ export function assignParameterToArrayValue(param: number, t: ArrayToken, p: Nat
         if (isExpression(arg)) // TODO: non-expression arguments?
             assignExpressionToArrayValue(arg, t, p);
     }
+}
+
+/**
+ * Returns the index of the first SpreadElement in `args`, or `args.length` if none.
+ * Args at indices below this are positional (prefix); args at or after the spread
+ * are folded into `p.tailVar` by the outer call dispatcher and are not visible here.
+ */
+export function spreadIndex(args: CallExpression["arguments"]): number {
+    const i = args.findIndex(isSpreadElement);
+    return i === -1 ? args.length : i;
+}
+
+/**
+ * Calls `prefixCb` for each Expression in `p.callArgs[from..spread)`, and
+ * `tailCb(p.tailVar)` once if a SpreadElement appears at or after `from`.
+ */
+export function forEachVariadicArg(
+    p: NativeFunctionParams,
+    from: number,
+    prefixCb: (arg: Expression, i: number) => void,
+    tailCb?: (tailVar: ConstraintVar) => void,
+) {
+    const spreadIdx = spreadIndex(p.callArgs);
+    for (let i = from; i < spreadIdx; i++) {
+        const arg = p.callArgs[i];
+        if (isExpression(arg))
+            prefixCb(arg, i);
+    }
+    if (spreadIdx < p.callArgs.length && spreadIdx >= from && p.tailVar && tailCb)
+        tailCb(p.tailVar);
 }
 
 /**
@@ -333,26 +365,36 @@ type CallbackKind =
  */
 export function invokeCallback(kind: CallbackKind, p: NativeFunctionParams, arg: number = 0, key: TokenListener = TokenListener.NATIVE_INVOKE_CALLBACK) {
     const args = p.callArgs;
-    if (args.length > arg) {
-        const funarg = args[arg];
-        const bt = p.base;
-        if (isExpression(funarg)) { // TODO: SpreadElement? non-MemberExpression?
-            const funVar = p.solver.varProducer.expVar(funarg, p.path);
-            p.solver.addForAllTokensConstraint(funVar, key, {n: funarg, t: bt, s: kind}, (ft: Token) => {
-                if (!(ft instanceof FunctionToken || ft instanceof AccessPathToken))
-                    return; // TODO: ignoring native functions etc.
-
-                invokeCallbackBound(kind, p, bt, ft);
-
-                if (ft instanceof AccessPathToken) {
-                    const caller = p.solver.globalState.getEnclosingFunctionOrModule(p.path);
-                    p.solver.fragmentState.registerEscapingToExternal(funVar, funarg, caller);
-
-                    // TODO: see case AccessPathToken in Operations.callFunction
-                }
-            });
+    const bt = p.base;
+    const spreadIdx = spreadIndex(args);
+    // determine the callback source variable: either the prefix expression at
+    // position `arg`, or p.tailVar if the spread starts at or before `arg`.
+    let funVar: ConstraintVar | undefined;
+    let funarg: Node | undefined;
+    if (arg < spreadIdx) {
+        const expr = args[arg];
+        if (isExpression(expr)) {
+            funVar = p.solver.varProducer.expVar(expr, p.path);
+            funarg = expr;
         }
+    } else if (p.tailVar) {
+        funVar = p.tailVar;
+        funarg = p.path.node;
     }
+    if (funVar)
+        p.solver.addForAllTokensConstraint(funVar, key, {n: funarg!, t: bt, s: kind}, (ft: Token) => {
+            if (!(ft instanceof FunctionToken || ft instanceof AccessPathToken))
+                return; // TODO: ignoring native functions etc.
+
+            invokeCallbackBound(kind, p, bt, ft);
+
+            if (ft instanceof AccessPathToken) {
+                const caller = p.solver.globalState.getEnclosingFunctionOrModule(p.path);
+                p.solver.fragmentState.registerEscapingToExternal(funVar!, funarg!, caller);
+
+                // TODO: see case AccessPathToken in Operations.callFunction
+            }
+        });
 }
 
 /**
@@ -379,9 +421,9 @@ export function invokeCallbackBound(kind: CallbackKind, p: NativeFunctionParams,
     const pResultVar = vp.expVar(p.path.node, p.path);
     const caller = a.getEnclosingFunctionOrModule(p.path);
 
-    const modelCall = (args: Array<Token | ConstraintVar | undefined>, baseVar?: ConstraintVar, resultVar?: ConstraintVar) => {
+    const modelCall = (args: Array<Token | ConstraintVar | undefined>, baseVar?: ConstraintVar, resultVar?: ConstraintVar, tailVar?: ConstraintVar) => {
         assert(ft instanceof FunctionToken);
-        p.op.callFunctionTokenBound(ft, baseVar, caller, args, resultVar, false, p.path as CallNodePath, {native: true});
+        p.op.callFunctionTokenBound(ft, baseVar, caller, args, resultVar, false, p.path as CallNodePath, {native: true}, tailVar);
     };
 
     // helper for constructing unique intermediate variables
@@ -538,11 +580,22 @@ export function invokeCallbackBound(kind: CallbackKind, p: NativeFunctionParams,
             break;
         }
         case "queueMicrotask":
-        case "setImmediate": // TODO: pass arguments
-        case "setInterval": // TODO: pass arguments
-        case "setTimeout": // TODO: pass arguments
-            if (ft instanceof FunctionToken) // TODO: handle indirect calls to AccessPathToken
-                modelCall(kind !== "queueMicrotask" ? args.slice(2).map(arg => isExpression(arg) ? vp.expVar(arg, p.path) : undefined) : []);
+        case "setImmediate":
+        case "setInterval":
+        case "setTimeout":
+            if (ft instanceof FunctionToken) { // TODO: handle indirect calls to AccessPathToken
+                if (kind === "queueMicrotask") {
+                    modelCall([]);
+                    break;
+                }
+                // Trailing args (after the callback, and delay for setTimeout/Interval)
+                // are passed to the callback; spread among them lands in tailVar.
+                const from = kind === "setImmediate" ? 1 : 2;
+                const spreadIdx = spreadIndex(args);
+                const prefixArgs = args.slice(from, Math.max(from, spreadIdx)).map(arg => isExpression(arg) ? vp.expVar(arg, p.path) : undefined);
+                const tailVar = spreadIdx >= from ? p.tailVar : undefined;
+                modelCall(prefixArgs, undefined, undefined, tailVar);
+            }
             break;
         default:
             kind satisfies never; // ensure that switch is exhaustive
@@ -581,16 +634,22 @@ export function invokeCallApply(kind: CallApplyKind, p: NativeFunctionParams) {
         const basearg = args[0];
         const caller = a.getEnclosingFunctionOrModule(p.path);
 
+        // SpreadElements at or after `spreadIdx` are folded into p.tailVar by the
+        // outer call dispatcher; native handlers can only consult `args` up to here.
+        const spreadIdx = spreadIndex(args);
+
         let argVars: Array<ConstraintVar | undefined> = [];
         // TODO: also model conversion for basearg to objects, see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Function/call
         // arguments
         switch (kind) {
             case "Function.prototype.call":
-                // TODO: SpreadElement
-                argVars = args.slice(1).map(arg => isExpression(arg) ? vp.expVar(arg, p.path) : undefined);
+                // prefix arguments at positions 1..spreadIdx; everything beyond
+                // (including the first spread) is carried by p.tailVar.
+                argVars = args.slice(1, spreadIdx).map(arg => isExpression(arg) ? vp.expVar(arg, p.path) : undefined);
                 break;
             case "Function.prototype.apply": {
-                if (args.length >= 2 && isExpression(args[1])) { // TODO: SpreadElement
+                // we can only see the apply-array argument if it appears in the prefix
+                if (spreadIdx >= 2 && isExpression(args[1])) {
                     const argVar = vp.expVar(args[1], p.path);
                     // model dynamic parameter passing like 'callFunctionTokenBound'
                     p.solver.addForAllTokensConstraint(argVar, TokenListener.NATIVE_INVOKE_CALL_APPLY2, ft.fun, (t: Token) => {
@@ -615,11 +674,13 @@ export function invokeCallApply(kind: CallApplyKind, p: NativeFunctionParams) {
             }
         }
 
-        // base value
-        // TODO: SpreadElement? non-MemberExpression?
-        const baseVar = isExpression(basearg) ? vp.expVar(basearg, p.path) : undefined;
+        // thisArg only known when in the prefix; otherwise it's inside tailVar
+        // and not separable, so fall back to undefined.
+        const baseVar = spreadIdx >= 1 && isExpression(basearg) ? vp.expVar(basearg, p.path) : undefined;
         const resultVar = vp.expVar(p.path.node, p.path);
-        p.op.callFunctionTokenBound(ft, baseVar, caller, argVars, resultVar, false, p.path as CallNodePath, {native: true});
+        // For 'apply', the tail would be an unknown apply-array (not modeled), so drop it.
+        const tailVar = kind === "Function.prototype.call" ? p.tailVar : undefined;
+        p.op.callFunctionTokenBound(ft, baseVar, caller, argVars, resultVar, false, p.path as CallNodePath, {native: true}, tailVar);
     }
 }
 
@@ -630,28 +691,40 @@ export function functionBind(p: NativeFunctionParams) {
     const args = p.callArgs;
     const basearg = args[0];
     if (p.base instanceof FunctionToken) { // TODO: ignoring native functions etc.
-        if (isExpression(basearg) && !isArrowFunctionExpression(p.base.fun)) { // TODO:SpreadElement? non-MemberExpression?
+        const spreadIdx = spreadIndex(args);
+        const vp = p.solver.varProducer;
+        if (spreadIdx >= 1 && isExpression(basearg) && !isArrowFunctionExpression(p.base.fun)) {
             // base value (skip for arrow functions, which don't have their own 'this')
-            const baseVar = p.solver.varProducer.expVar(basearg, p.path);
-            p.solver.addSubsetConstraint(baseVar, p.solver.varProducer.thisVar(p.base.fun));
+            const baseVar = vp.expVar(basearg, p.path);
+            p.solver.addSubsetConstraint(baseVar, vp.thisVar(p.base.fun));
         }
         // TODO: also model conversion for basearg to objects, see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Function/bind
-        // bind partial arguments to function parameters
-        if (args.length > 1) {
-            const params = p.base.fun.params;
-            for (let i = 1; i < args.length && i - 1 < params.length; i++) {
-                const arg = args[i];
-                if (isExpression(arg) && isIdentifier(params[i - 1])) { // TODO: non-Identifier parameters?
-                    const argVar = p.solver.varProducer.expVar(arg, p.path);
-                    p.solver.addSubsetConstraint(argVar, p.solver.varProducer.nodeVar(params[i - 1]));
-                }
+        // bind partial arguments to function parameters (only the prefix is positional)
+        const params = p.base.fun.params;
+        for (let i = 1; i < spreadIdx && i - 1 < params.length; i++) {
+            const arg = args[i];
+            if (isExpression(arg) && isIdentifier(params[i - 1])) { // TODO: non-Identifier parameters?
+                const argVar = vp.expVar(arg, p.path);
+                p.solver.addSubsetConstraint(argVar, vp.nodeVar(params[i - 1]));
+            }
+        }
+        // tailVar values bind to every remaining (non-rest) parameter, and to the rest array's unknown slot
+        if (p.tailVar) {
+            const prefixBound = Math.max(0, spreadIdx - 1); // number of params already bound by prefix
+            for (let j = prefixBound; j < params.length; j++) {
+                const param = params[j];
+                if (isRestElement(param)) {
+                    const restArr = p.op.newArrayToken(param);
+                    p.solver.addSubsetConstraint(p.tailVar, vp.arrayUnknownVar(restArr));
+                    p.solver.addTokenConstraint(restArr, vp.nodeVar(param));
+                    break;
+                } else if (isIdentifier(param)) // TODO: non-Identifier parameters?
+                    p.solver.addSubsetConstraint(p.tailVar, vp.nodeVar(param));
             }
         }
         // return value
-        p.solver.addTokenConstraint(p.base, p.solver.varProducer.expVar(p.path.node, p.path));
+        p.solver.addTokenConstraint(p.base, vp.expVar(p.path.node, p.path));
     }
-    if (!args.every(arg => isExpression(arg)))
-        warnNativeUsed("Function.prototype.bind", p, "with SpreadElement"); // TODO: SpreadElement
 }
 
 /**
@@ -726,8 +799,15 @@ export function assignBaseArrayArrayValueToArray(t: ArrayToken, p: NativeFunctio
  */
 export function callPromiseExecutor(p: NativeFunctionParams) {
     const args = p.callArgs;
-    if (args.length >= 1 && isExpression(args[0])) { // TODO: SpreadElement? non-MemberExpression?
-        const funVar = p.solver.varProducer.expVar(args[0], p.path);
+    const spreadIdx = spreadIndex(args);
+    // executor source variable: either args[0] in the prefix, or p.tailVar if spread covers position 0
+    let funVar: ConstraintVar | undefined;
+    if (spreadIdx >= 1) {
+        if (args.length >= 1 && isExpression(args[0]))
+            funVar = p.solver.varProducer.expVar(args[0], p.path);
+    } else
+        funVar = p.tailVar;
+    if (funVar) {
         const caller = p.solver.globalState.getEnclosingFunctionOrModule(p.path);
         p.solver.addForAllTokensConstraint(funVar, TokenListener.CALL_PROMISE_EXECUTOR, p.path.node, (t: Token) => {
             if (t instanceof FunctionToken)
@@ -814,11 +894,17 @@ export function returnResolvedPromise(kind: "resolve" | "reject", p: NativeFunct
  */
 export function returnPromiseIterator(kind: "all" | "allSettled" | "any" | "race", p: NativeFunctionParams) {
     const args = p.callArgs;
-    if (args.length >= 1 && isExpression(args[0])) { // TODO: non-Expression?
-        const arg = p.op.expVar(args[0], p.path);
-        if (arg) {
-            // make a new promise and return it
-            const promise = newSpecialObject("Promise", p);
+    const spreadIdx = spreadIndex(args);
+    let arg: ConstraintVar | undefined;
+    if (spreadIdx >= 1 && args.length >= 1 && isExpression(args[0]))
+        arg = p.op.expVar(args[0], p.path);
+    else if (spreadIdx === 0 && p.tailVar)
+        // Promise.all(...x): the iterable is whichever value lands at position 0
+        // of the post-spread argument list, which is over-approximated by tailVar.
+        arg = p.tailVar;
+    if (arg !== undefined) {
+        // make a new promise and return it
+        const promise = newSpecialObject("Promise", p);
             p.solver.addTokenConstraint(promise, p.solver.varProducer.expVar(p.path.node, p.path));
             let array: ArrayToken | undefined;
             if (kind === "all" || kind === "allSettled") {
@@ -894,7 +980,6 @@ export function returnPromiseIterator(kind: "all" | "allSettled" | "any" | "race
                         break;
                 }
             });
-        }
     }
 }
 
@@ -922,7 +1007,7 @@ export function setPrototypeOf(p: NativeFunctionParams) {
 /**
  * Models the behavior of Object.assign.
  */
-export function assignProperties(target: Expression, sources: Array<Node>, p: NativeFunctionParams) {
+export function assignProperties(target: Expression, sources: Array<Node>, p: NativeFunctionParams, extra?: ConstraintVar) {
     const tVar = p.op.expVar(target, p.path);
     if (!tVar)
         return;
@@ -933,9 +1018,10 @@ export function assignProperties(target: Expression, sources: Array<Node>, p: Na
             const sVar = p.op.expVar(src, p.path);
             if (sVar)
                 sVars.push(sVar);
-        } else
-            warnNativeUsed("Object.assign", p, "with non-expression source");
+        }
     }
+    if (extra)
+        sVars.push(extra);
 
     if (sVars.length === 0)
         return;

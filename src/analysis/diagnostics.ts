@@ -31,6 +31,10 @@ export default class AnalysisDiagnostics {
 
     analysisTime: bigint = 0n; // set when analysis is completed
 
+    cfgTime: bigint = 0n;
+
+    defUseTime: bigint = 0n;
+
     codeSize: number = 0;
 
     codeSizeMain: number = 0;
@@ -78,6 +82,8 @@ export default class AnalysisDiagnostics {
     arrayEntriesListenerNotifications: number = 0;
 
     objectPropertiesListenerNotifications: number = 0;
+
+    nonEmptyListenerNotifications: number = 0;
 
     waveLimitReached: number = 0;
 

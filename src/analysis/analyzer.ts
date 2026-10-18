@@ -5,13 +5,14 @@ import Solver, {AbortedException} from "./solver";
 import Timer, {nanoToMs, TimeoutException} from "../misc/timer";
 import {getMapHybridSetSize, percent} from "../misc/util";
 import {visit} from "./astvisitor";
-import {FunctionInfo} from "./infos";
+import {FunctionInfo, ModuleInfo} from "./infos";
 import {options, resolveBaseDir} from "../options";
 import {findModules} from "./modulefinder";
 import {parseAndDesugar} from "../parsing/parser";
 import {findEscapingObjects} from "./escaping";
 import {buildGlobalNatives, buildModuleNatives} from "../natives/nativebuilder";
 import {AnalysisStateReporter} from "../output/analysisstatereporter";
+import {getExportedFunctions} from "./exported";
 import {Operations} from "./operations";
 import {preprocessAst} from "../parsing/extras";
 import {patchDynamics} from "../patching/patchdynamics";
@@ -21,7 +22,8 @@ import {applyPendingForceIncludes} from "./callEdgePriors";
 import {ProcessManager} from "../approx/processmanager";
 import {Patching} from "../approx/patching";
 import {PatchingDiagnostics} from "../approx/diagnostics";
-import {patchThis} from "../patching/patchthis";
+import {buildProgramCFG, CFGBuildError} from "../cfg/builder";
+import {computeDefUse} from "../cfg/defuse";
 
 export async function analyzeFiles(files: Array<string>, solver: Solver) {
     const a = solver.globalState;
@@ -98,6 +100,24 @@ export async function analyzeFiles(files: Array<string>, solver: Solver) {
 
                         } else {
 
+                            // compute def-use information for flow-sensitive treatment of local variables (unless --no-def-use;
+                            // narrowing builds on the def-use machinery, so --no-def-use also disables it);
+                            // done before preprocessAst so that the artificial module parameters resolve to no binding
+                            if (options.defUse)
+                                try {
+                                    const t1 = new Timer();
+                                    const pcfg = buildProgramCFG(ast, options.narrow);
+                                    d.cfgTime += t1.elapsed();
+                                    const t2 = new Timer();
+                                    a.defUse.set(moduleInfo, computeDefUse(pcfg));
+                                    d.defUseTime += t2.elapsed();
+                                } catch (ex) {
+                                    if (!(ex instanceof CFGBuildError))
+                                        throw ex;
+                                    // without def-use information, the module is analyzed flow-insensitively (sound)
+                                    solver.fragmentState.warn(`CFG construction failed, skipping def-use for ${moduleInfo} (${ex.message})`);
+                                }
+
                             // preprocess the AST
                             const moduleParams = preprocessAst(ast, moduleInfo);
 
@@ -130,14 +150,6 @@ export async function analyzeFiles(files: Array<string>, solver: Solver) {
 
                 if (!options.modulesOnly) {
 
-                    // patch using escape analysis
-                    if (options.patchEscaping) {
-                        const t = new Timer();
-                        findEscapingObjects(Array.from(a.moduleInfos.values()), solver); // TODO: currently using all modules in a
-                        await solver.propagate("Escape patching");
-                        d.totalEscapePatchingTime += t.elapsed();
-                    }
-
                     // patch using hints from approximate interpretation
                     if (options.approx || options.approxLoad) {
                         const t = new Timer();
@@ -146,15 +158,21 @@ export async function analyzeFiles(files: Array<string>, solver: Solver) {
                         d.totalApproxPatchingTime += t.elapsed();
                     }
 
+                    // patch using escape analysis
+                    if (options.patchEscaping) {
+                        const t = new Timer();
+                        findEscapingObjects(Array.from(a.moduleInfos.values()), solver); // TODO: currently using all modules, restrict to relevant packages?
+                        await solver.propagate("Escape patching");
+                        d.totalEscapePatchingTime += t.elapsed();
+                    }
+
                     // patch heuristics
-                    if (options.patchDynamics || options.patchMethodCalls || options.patchThis) {
+                    if (options.patchDynamics || options.patchMethodCalls) {
                         const t = new Timer();
                         if (options.patchDynamics)
                             patchDynamics(solver);
                         if (options.patchMethodCalls)
                             patchMethodCalls(solver);
-                        if (options.patchThis)
-                            patchThis(solver);
                         await solver.propagate("Extra patching");
                         d.totalOtherPatchingTime += t.elapsed();
                     }
@@ -210,7 +228,10 @@ export async function analyzeFiles(files: Array<string>, solver: Solver) {
         d.externalOnlyCalls = r.getZeroButExternalCalleeCalls();
         d.nativeOrExternalCalls = r.getZeroButNativeOrExternalCalleeCalls();
         d.functionsWithZeroCallers = r.getZeroCallerFunctions().size;
-        d.reachableFunctions = Array.from(r.getReachableModulesAndFunctions(r.getEntryModules())).filter(r => r instanceof FunctionInfo).length;
+        const entries = new Set<FunctionInfo | ModuleInfo>(r.getEntryModules());
+        for (const fi of getExportedFunctions(f))
+            entries.add(fi);
+        d.reachableFunctions = Array.from(r.getReachableModulesAndFunctions(entries)).filter(r => r instanceof FunctionInfo).length;
         if (logger.isInfoEnabled()) {
             logger.info(`Analyzed packages: ${d.packages}, modules: ${d.modules}, functions: ${a.functionInfos.size}, code size main: ${Math.ceil(d.codeSizeMain / 1024)}KB, dependencies: ${Math.ceil(d.codeSizeDependencies / 1024)}KB`);
             logger.info(`Call edges function->function: ${d.functionToFunctionEdges}, call->function: ${d.callToFunctionEdges}`);
@@ -224,13 +245,16 @@ export async function analyzeFiles(files: Array<string>, solver: Solver) {
             logger.info(`Analysis time: ${nanoToMs(d.analysisTime)}, memory usage: ${d.maxMemoryUsage}MB${!options.gc ? " (without --gc)" : ""}`);
             logger.info(`Analysis errors: ${d.errors}, warnings: ${d.warnings}${getMapHybridSetSize(f.warningsUnsupported) > 0 && !options.warningsUnsupported ? " (show all with --warnings-unsupported)" : ""}`);
             if (options.diagnostics) {
+                if (options.defUse)
+                    logger.info(`CFG time: ${nanoToMs(d.cfgTime)}, def-use time: ${nanoToMs(d.defUseTime)}`);
                 logger.info(`Propagations: ${d.propagations}, listener notification rounds: ${d.listenerNotificationRounds}`);
                 if (options.maxWaves !== undefined)
                     logger.info(`Fixpoint wave limit reached: ${d.waveLimitReached} time${d.waveLimitReached !== 1 ? "s" : ""}`);
                 logger.info(`Constraint vars: ${f.getNumberOfVarsWithTokens()} (${f.vars.size}), tokens: ${d.tokens}, subset edges: ${d.subsetEdges}, max tokens: ${f.getLargestTokenSetSize()}, max subset out: ${f.getLargestSubsetEdgeOutDegree()}, redirections: ${f.redirections.size}`);
                 logger.info(`Listeners (notifications) token: ${f.tokenListeners.totalSize()} (${d.tokenListenerNotifications}), bounded: ${f.tokenListeners2.totalSize()} (${d.tokenListener2Notifications}), ` +
                     `array: ${f.arrayEntriesListeners.totalSize()} (${d.arrayEntriesListenerNotifications}), ` +
-                    `obj: ${f.objectPropertiesListeners.totalSize()} (${d.objectPropertiesListenerNotifications})`);
+                    `obj: ${f.objectPropertiesListeners.totalSize()} (${d.objectPropertiesListenerNotifications}), ` +
+                    `nonempty: ${f.nonEmptyListeners.totalSize()} (${d.nonEmptyListenerNotifications})`);
                 logger.info(`Canonicalize vars: ${a.canonicalConstraintVars.size} (${a.numberOfCanonicalizeVarCalls}), tokens: ${a.canonicalTokens.size} (${a.numberOfCanonicalizeTokenCalls}), access paths: ${a.canonicalAccessPaths.size} (${a.numberOfCanonicalizeAccessPathCalls})`);
                 logger.info(`Propagation: ${nanoToMs(d.totalPropagationTime)}, listeners: ${nanoToMs(d.totalListenerCallTime)}` +
                     `, finalization: ${nanoToMs(d.finalizationTime)}`);

@@ -234,6 +234,56 @@ export function addAll<T>(from: Iterable<T> | Set<T> | Array<T> | undefined, to:
     return to.size - before;
 }
 
+/**
+ * A binary min-heap of numbers.
+ */
+export class MinHeap {
+
+    private readonly heap: Array<number> = [];
+
+    get size(): number {
+        return this.heap.length;
+    }
+
+    push(x: number): void {
+        const a = this.heap;
+        let i = a.push(x) - 1;
+        while (i > 0) {
+            const p = (i - 1) >> 1;
+            if (a[p] <= a[i])
+                break;
+            [a[p], a[i]] = [a[i], a[p]];
+            i = p;
+        }
+    }
+
+    /** Removes and returns the smallest element (undefined if the heap is empty). */
+    pop(): number | undefined {
+        const a = this.heap;
+        if (a.length === 0)
+            return undefined;
+        const top = a[0];
+        const last = a.pop()!;
+        if (a.length > 0) {
+            a[0] = last;
+            let i = 0;
+            for (;;) {
+                const l = 2 * i + 1, r = l + 1;
+                let m = i;
+                if (l < a.length && a[l] < a[m])
+                    m = l;
+                if (r < a.length && a[r] < a[m])
+                    m = r;
+                if (m === i)
+                    break;
+                [a[i], a[m]] = [a[m], a[i]];
+                i = m;
+            }
+        }
+        return top;
+    }
+}
+
 export function setAll<K, V>(from: Map<K, V>, to: Map<K, V>) {
     for (const [k, v] of from)
         to.set(k, v);
@@ -351,6 +401,16 @@ export function pushAll<V>(from: Iterable<V>, to: Array<V>) {
  */
 export function escapeRegExp(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Escapes a string for use in a double-quoted Graphviz label.
+ */
+export function escapeDot(s: string): string {
+    return s
+        .replaceAll("\\", "\\\\")
+        .replaceAll("\"", "\\\"")
+        .replaceAll("\n", "\\n");
 }
 
 /**

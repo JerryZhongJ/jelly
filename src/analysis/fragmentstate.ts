@@ -39,7 +39,7 @@ import {isCallExcluded, locKeyFromLoc, locKeyFromNode, type Priors} from "./call
 import {MaybeEmptyPropertyRead} from "../patching/patchdynamics";
 import {getEnclosingNonArrowFunction, isInTryBlockOrBranch} from "../misc/asthelpers";
 import {isAbsoluteModuleName, isLocalRequire, resolveModule} from "../misc/files";
-import {ArrayMap, ArrayMapMap, ArrayMapSet} from "../misc/arraymap";
+import {ArrayMap, ArrayMapArray, ArrayMapMap, ArrayMapSet} from "../misc/arraymap";
 
 export type ListenerID = bigint;
 
@@ -77,7 +77,8 @@ type RVT = RepresentativeVar;
 
 export type PostponedListenerCall =
     [(t: Token) => void, Token] |
-    [(prop: string) => void, string];
+    [(prop: string) => void, string] |
+    [() => void, undefined];
 
 /**
  * Analysis state for a fragment (a module or a package with dependencies, depending on the analysis phase).
@@ -125,6 +126,12 @@ export class FragmentState {
     readonly tokenListeners: ArrayMapMap<ConstraintVar, RVT, ListenerID, (t: Token) => void>;
 
     readonly tokenListeners2: ArrayMapMap<ConstraintVar, RVT, ListenerID, (t: Token) => void>;
+
+    /**
+     * Listeners that are invoked once when a constraint variable becomes nonempty (see 'addIfNonEmptyConstraint').
+     * The entry for a variable is removed when the listeners have been invoked, so a pending entry implies the variable is empty.
+     */
+    readonly nonEmptyListeners: ArrayMapArray<ConstraintVar, RVT, () => void>;
 
     readonly listenersProcessed: Map<ListenerID, Set<Token>> = new Map;
 
@@ -386,6 +393,7 @@ export class FragmentState {
         this.reverseSubsetEdges = new ArrayMapSet(this.a.vars);
         this.tokenListeners = new ArrayMapMap(this.a.vars);
         this.tokenListeners2 = new ArrayMapMap(this.a.vars);
+        this.nonEmptyListeners = new ArrayMapArray(this.a.vars);
         this.arrayEntries = new ArrayMapSet(this.a.tokens);
         this.objectProperties = new ArrayMapSet(this.a.tokens);
         this.arrayEntriesListeners = new ArrayMapMap(this.a.tokens);

@@ -4,13 +4,14 @@ import {
     addInherits,
     assignBaseArrayArrayValueToArray,
     assignBaseArrayValueToArray,
+    assignExpressionToArrayValue,
     assignIteratorMapValuePairs,
     assignIteratorValuesToArrayValue,
     assignIteratorValuesToProperty,
-    assignParameterToArrayValue,
     assignParameterToThisArrayValue,
     assignParameterToThisProperty,
     assignProperties,
+    forEachVariadicArg,
     callPromiseExecutor,
     defineGetterSetter,
     defineProperties,
@@ -39,10 +40,12 @@ import {
     returnToken,
     returnUnknown,
     setPrototypeOf,
+    spreadIndex,
     warnNativeUsed,
 } from "./nativehelpers";
 import {
     AllocationSiteToken,
+    ArrayToken,
     FunctionToken,
     NativeObjectToken,
     ObjectKind,
@@ -304,8 +307,9 @@ export const ecmascriptModels: NativeModel = {
             ],
             invoke: (p: NativeFunctionParams) => {
                 const t = newArray(p);
-                for (let i = 0; i < p.callArgs.length; i++)
-                    assignParameterToArrayValue(i, t, p);
+                forEachVariadicArg(p, 0,
+                    (arg) => assignExpressionToArrayValue(arg, t, p),
+                    (tv) => p.solver.addSubsetConstraint(tv, p.solver.varProducer.arrayUnknownVar(t)));
                 returnToken(t, p);
             },
             staticMethods: [
@@ -313,11 +317,15 @@ export const ecmascriptModels: NativeModel = {
                     name: "from",
                     invoke: (p: NativeFunctionParams) => {
                         const t = newArray(p);
-                        if (!p.callArgs.every(arg => isExpression(arg)))
-                            warnNativeUsed("Array.from", p, "with SpreadElement"); // TODO: SpreadElement
-                        else if (p.callArgs.length > 0)
+                        const spreadIdx = spreadIndex(p.callArgs);
+                        if (spreadIdx >= 1)
+                            // iterable argument is in the prefix
                             assignIteratorValuesToArrayValue(0, t, p);
-                        if (p.callArgs.length > 1) {
+                        else if (p.tailVar)
+                            // Array.from(...iter): each value in tailVar is itself an iterable;
+                            // read iterator values from each into the result array's unknown slot
+                            p.op.readIteratorValue(p.tailVar, p.solver.varProducer.arrayUnknownVar(t), p.path.node);
+                        if (spreadIdx >= 2) {
                             // TODO: connect p.callArgs[0] iterable/arrayLike values to mapFn
                             // TODO: connect returnVar of mapFn to array value of t
                             // TODO: if p.callArgs.length > 2, connect thisArg to thisVar of mapFn
@@ -333,8 +341,9 @@ export const ecmascriptModels: NativeModel = {
                     name: "of",
                     invoke: (p: NativeFunctionParams) => {
                         const t = newArray(p);
-                        for (let i = 0; i < p.callArgs.length; i++)
-                            assignParameterToArrayValue(i, t, p);
+                        forEachVariadicArg(p, 0,
+                            (arg) => assignExpressionToArrayValue(arg, t, p),
+                            (tv) => p.solver.addSubsetConstraint(tv, p.solver.varProducer.arrayUnknownVar(t)));
                         returnToken(t, p);
                     }
                 }
@@ -351,10 +360,17 @@ export const ecmascriptModels: NativeModel = {
                     invoke: (p: NativeFunctionParams) => {
                         const t = newArray(p);
                         assignBaseArrayValueToArray(t, p);
-                        for (let i = 0; i < p.callArgs.length; i++) {
-                            assignIteratorValuesToArrayValue(i, t, p);
-                            assignParameterToArrayValue(i, t, p); // TODO: could omit arrays among the arguments (see also 'flat' below)
-                        }
+                        const dst = p.solver.varProducer.arrayUnknownVar(t);
+                        forEachVariadicArg(p, 0,
+                            (arg, i) => {
+                                assignIteratorValuesToArrayValue(i, t, p);
+                                assignExpressionToArrayValue(arg, t, p); // TODO: could omit arrays among the arguments (see also 'flat' below)
+                            },
+                            (tv) => {
+                                // each tailVar value: if iterable, contribute its elements; also pass through as a value
+                                p.op.readIteratorValue(tv, dst, p.path.node);
+                                p.solver.addSubsetConstraint(tv, dst);
+                            });
                         returnToken(t, p);
                     }
                 },
@@ -470,7 +486,12 @@ export const ecmascriptModels: NativeModel = {
                 {
                     name: "push",
                     invoke: (p: NativeFunctionParams) => {
-                        assignParameterToThisArrayValue(0, p);
+                        if (p.base instanceof ArrayToken) {
+                            const dst = p.solver.varProducer.arrayUnknownVar(p.base);
+                            forEachVariadicArg(p, 0,
+                                (arg) => assignExpressionToArrayValue(arg, p.base as ArrayToken, p),
+                                (tv) => p.solver.addSubsetConstraint(tv, dst));
+                        }
                     }
                 },
                 {
@@ -517,8 +538,9 @@ export const ecmascriptModels: NativeModel = {
                     invoke: (p: NativeFunctionParams) => {
                         const t = returnShuffledArray(p);
                         if (t)
-                            for (let i = 2; i < p.callArgs.length; i++)
-                                assignParameterToArrayValue(i, t, p);
+                            forEachVariadicArg(p, 2,
+                                (arg) => assignExpressionToArrayValue(arg, t, p),
+                                (tv) => p.solver.addSubsetConstraint(tv, p.solver.varProducer.arrayUnknownVar(t)));
                     }
                 },
                 {
@@ -530,7 +552,12 @@ export const ecmascriptModels: NativeModel = {
                 {
                     name: "unshift",
                     invoke: (p: NativeFunctionParams) => {
-                        assignParameterToThisArrayValue(0, p);
+                        if (p.base instanceof ArrayToken) {
+                            const dst = p.solver.varProducer.arrayUnknownVar(p.base);
+                            forEachVariadicArg(p, 0,
+                                (arg) => assignExpressionToArrayValue(arg, p.base as ArrayToken, p),
+                                (tv) => p.solver.addSubsetConstraint(tv, dst));
+                        }
                     }
                 },
                 {
@@ -1239,14 +1266,19 @@ export const ecmascriptModels: NativeModel = {
                     name: "assign",
                     invoke: (p: NativeFunctionParams) => {
                         const args = p.callArgs;
-                        if (args.length >= 1) {
-                            if (!isExpression(args[0]))
-                                warnNativeUsed("Object.assign", p, "with non-expression as target");
-                            else {
-                                returnArgument(args[0], p);
-                                assignProperties(args[0], args.slice(1), p);
-                            }
+                        if (args.length === 0)
+                            return;
+                        const spreadIdx = spreadIndex(args);
+                        // If args[0] isn't a plain Expression (e.g. SpreadElement at position 0), bail.
+                        if (!isExpression(args[0])) {
+                            warnNativeUsed("Object.assign", p, "with non-expression as target");
+                            return;
                         }
+                        returnArgument(args[0], p);
+                        // prefix sources are args[1..spreadIdx]; spread sources contributed via tailVar
+                        const prefixSources = args.slice(1, spreadIdx);
+                        const tailVar = spreadIdx < args.length ? p.tailVar : undefined;
+                        assignProperties(args[0], prefixSources, p, tailVar);
                     }
                 },
                 {

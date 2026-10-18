@@ -714,6 +714,7 @@ for (const [name, val] of Object.entries({
             logger.debug(`$method ${mod}:${loc}${isDynamic ? " dynamic" : ""}${isOptionalMember ? " optionalMember" : ""}${isOptionalCall ? " optionalCall" : ""}`);
         let fun;
         try {
+            // reads the property after the arguments (wrong JS order), accepted so read failures can be suppressed
             fun = isOptionalMember && (base === undefined || base === null) ? undefined : base[prop];
         } catch (ex) {
             if (logger.isDebugEnabled())

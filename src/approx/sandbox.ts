@@ -41,6 +41,7 @@ export function patchGlobalBuiltins() {
     Error.captureStackTrace = emptyFunction; // TODO: Error (parser writes to Error.prepareStackTrace)
     Atomics.wait = Atomics.waitAsync = theProxy;
     Module.register = function() {};
+    process.env.DISABLE_V8_COMPILE_CACHE = "1"; // v8-compile-cache (e.g. bundled by eslint) patches Module._compile to compile via vm, bypassing instrumentation
 
     // replace Module._load
     const realLoad = (Module as any)._load;
@@ -62,6 +63,13 @@ export function patchGlobalBuiltins() {
 
     // DOM specific interface
     g.window = g.document = theProxy;
+
+    // Blob/File and URL.createObjectURL/revokeObjectURL: on Node >=22, feeding a
+    // Proxy placeholder into these aborts the process with a native SIGABRT
+    // (Blob::New / Blob::StoreDataObject) rather than a catchable exception.
+    g.Blob = g.File = theProxy;
+    if (g.URL)
+        g.URL.createObjectURL = g.URL.revokeObjectURL = theProxy;
 
     // freeze objects and properties
     for (const x of [

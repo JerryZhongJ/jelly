@@ -43,6 +43,7 @@ import {
 import {NodePath} from "@babel/traverse";
 import {isCallExcluded, locKeyFromNode} from "./callEdgePriors";
 import {
+    forEachPatternIdentifier,
     getAdjustedCallNodePath,
     getConstantString,
     getEnclosingFunction,
@@ -308,13 +309,43 @@ export class Operations {
             return;
         }
 
-        const argVars = args.map(arg => {
-            if (isExpression(arg))
-                return this.expVar(arg, path);
-            else if (isSpreadElement(arg))
-                f.warnUnsupported(arg, "SpreadElement in arguments"); // TODO: SpreadElement in arguments
-            return undefined;
-        });
+        // split arguments into a positional prefix (up to the first SpreadElement)
+        // and a tailVar that collects all values after the first spread, with unknown position
+        const argVars: Array<ConstraintVar | undefined> = [];
+        let tailVar: ConstraintVar | undefined;
+        let tailArray: ArrayToken | undefined;
+        if (options.spread) {
+            // precise trailing spread `bar(a, b, ...src)` (single spread, last): order-preserving copy
+            // the callee binds per-index, vs. conflating every element onto every trailing param
+            const preciseSpread = args.length > 0 && isSpreadElement(args[args.length - 1])
+                && args.filter(isSpreadElement).length === 1;
+            for (const arg of args) {
+                if (tailVar === undefined) {
+                    if (isExpression(arg))
+                        argVars.push(this.expVar(arg, path));
+                    else if (isSpreadElement(arg)) {
+                        tailVar = vp.intermediateVar(path.node, "argTail");
+                        this.readIteratorValue(this.expVar(arg.argument, path), tailVar, path.node);
+                        if (preciseSpread)
+                            tailArray = this.buildSpreadArray(this.expVar(arg.argument, path), path.node);
+                    } else
+                        argVars.push(undefined);
+                } else if (isExpression(arg))
+                    this.solver.addSubsetConstraint(this.expVar(arg, path), tailVar);
+                else if (isSpreadElement(arg))
+                    this.readIteratorValue(this.expVar(arg.argument, path), tailVar, path.node);
+            }
+        } else {
+            for (const arg of args) {
+                if (isExpression(arg))
+                    argVars.push(this.expVar(arg, path));
+                else if (isSpreadElement(arg)) {
+                    f.warnUnsupported(arg, "SpreadElement in arguments (use --spread)");
+                    argVars.push(undefined);
+                } else
+                    argVars.push(undefined);
+            }
+        }
 
         if (options.interops && isIdentifier(p.node) && [
             "__importDefault", "__importStar", // TypeScript
@@ -335,7 +366,7 @@ export class Operations {
         // TODO: recognize by implementation instead of name for soundness and to also work on minified code?
 
         const handleCall = (base: ObjectPropertyVarObj | undefined, t: Token) => {
-            this.callFunctionBound(base, t, calleeVar, argVars, resultVar, strings, path);
+            this.callFunctionBound(base, t, calleeVar, argVars, resultVar, strings, path, tailVar, tailArray);
         };
 
         const key =
@@ -428,6 +459,8 @@ export class Operations {
         resultVar: ConstraintVar | undefined,
         strings: () => Array<string>,
         path: CallNodePath,
+        tailVar?: ConstraintVar | undefined,
+        tailArray?: ArrayToken | undefined,
     ) {
         const f = this.solver.fragmentState; // (don't use in callbacks)
         const caller = this.a.getEnclosingFunctionOrModule(path);
@@ -435,7 +468,7 @@ export class Operations {
         const args = path.node.arguments;
         const isNew = path.isNewExpression();
         if (t instanceof FunctionToken)
-            this.callFunctionTokenBound(t, base, caller, argVars, resultVar, isNew, path);
+            this.callFunctionTokenBound(t, base, caller, argVars, resultVar, isNew, path, {}, tailVar, tailArray);
         else if (t instanceof NativeObjectToken) {
             f.registerCall(pars.node, caller, undefined, {native: true});
             if (options.ignoreImpreciseNativeCalls && calleeVar && f.getTokensSize(f.getRepresentative(calleeVar))[0] > 2)
@@ -445,6 +478,7 @@ export class Operations {
                     base,
                     path,
                     callArgs: path.node.arguments,
+                    tailVar,
                     solver: this.solver,
                     op: this,
                     moduleInfo: this.moduleInfo,
@@ -493,8 +527,12 @@ export class Operations {
                     this.solver.addForAllTokensConstraint(argVar, TokenListener.CALL_EXTERNAL, pars.node, (at: Token) =>
                         this.invokeExternalCallback(at, pars.node, caller));
                     f.registerEscapingToExternal(argVar, args[i], caller);
-                } else if (isSpreadElement(args[i]))
-                    f.warnUnsupported(args[i], "SpreadElement in arguments to external function"); // TODO: SpreadElement in arguments to external function
+                }
+            }
+            if (tailVar) {
+                this.solver.addForAllTokensConstraint(tailVar, TokenListener.CALL_EXTERNAL, pars.node, (at: Token) =>
+                    this.invokeExternalCallback(at, pars.node, caller));
+                f.registerEscapingToExternal(tailVar, path.node, caller);
             }
             // TODO: also add arguments (and everything reachable from them) to escaping?
             // TODO: also add UnknownAccessPath to properties of object arguments for external functions? (see also TODO at AssignmentExpression)
@@ -526,6 +564,8 @@ export class Operations {
         isNew: boolean,
         path: CallNodePath,
         kind: {native?: boolean, accessor?: boolean, external?: boolean} = {},
+        tailVar?: ConstraintVar | undefined,
+        tailArray?: ArrayToken | undefined,
     ) {
         // helper function for adding a token or subset constraint
         const addInclusionConstraint = (from: Token | ConstraintVar, to: ConstraintVar) => {
@@ -548,13 +588,16 @@ export class Operations {
             if (i < t.fun.params.length) {
                 const param = t.fun.params[i];
                 if (isRestElement(param)) {
-                    // read the remaining arguments into a fresh array
+                    // read the remaining prefix arguments into a fresh array (positional),
+                    // and merge tailVar values into the array's unknown-index slot
                     const rest = args.slice(i);
-                    const t = this.newArrayToken(param);
-                    for (const [i, rarg] of rest.entries())
-                        if (rarg) // TODO: SpreadElement in arguments (warning emitted below)
-                            addInclusionConstraint(rarg, vp.objPropVar(t, String(i)));
-                    this.solver.addTokenConstraint(t, vp.nodeVar(param));
+                    const restArr = this.newArrayToken(param);
+                    for (const [j, rarg] of rest.entries())
+                        if (rarg)
+                            addInclusionConstraint(rarg, vp.objPropVar(restArr, String(j)));
+                    if (tailVar)
+                        this.solver.addSubsetConstraint(tailVar, vp.arrayUnknownVar(restArr));
+                    this.solver.addTokenConstraint(restArr, vp.nodeVar(param));
                 } else if (arg)
                     addInclusionConstraint(arg, vp.nodeVar(param));
             }
@@ -562,6 +605,49 @@ export class Operations {
             if (argumentsToken && arg)
                 addInclusionConstraint(arg, vp.objPropVar(argumentsToken, String(i)));
         }
+        // argument spread tail: `tailArray` binds each element to its exact position; `tailVar`
+        // (fallback) fans out to every trailing param, order conflated
+        const prefixLen = args.length;
+        const fanOutTail = (source: ConstraintVar) => {
+            for (let i = prefixLen; i < t.fun.params.length; i++) {
+                const param = t.fun.params[i];
+                if (isRestElement(param)) {
+                    const restArr = this.newArrayToken(param);
+                    this.solver.addSubsetConstraint(source, vp.arrayUnknownVar(restArr));
+                    this.solver.addTokenConstraint(restArr, vp.nodeVar(param));
+                    break;
+                } else
+                    this.solver.addSubsetConstraint(source, vp.nodeVar(param));
+            }
+            if (argumentsToken)
+                this.solver.addSubsetConstraint(source, vp.arrayUnknownVar(argumentsToken));
+        };
+        if (tailArray) {
+            const restIndex = t.fun.params.findIndex(isRestElement);
+            const restParam = restIndex >= 0 ? t.fun.params[restIndex] : undefined;
+            const fixedParamCount = restParam ? restIndex : t.fun.params.length;
+            // element i lands at position prefixLen + i: bind to that fixed param, else overflow to rest
+            this.solver.addForAllArrayEntriesConstraint(tailArray, TokenListener.CALL_FUNCTION_SPREAD_TAIL, {n: path.node, t}, (prop: string) => {
+                const vp2 = this.solver.varProducer;
+                const from = vp2.objPropVar(tailArray, prop);
+                const pos = prefixLen + Number(prop);
+                if (pos < fixedParamCount)
+                    this.solver.addSubsetConstraint(from, vp2.nodeVar(t.fun.params[pos]));
+                else if (restParam) {
+                    const restArr = this.newArrayToken(restParam);
+                    // rebased rest index shifts up when prefixLen > fixedParamCount, growing unboundedly
+                    // across a forwarding cycle (`g(extra, ...rest)` calling `g`), so conflate; else precise
+                    this.solver.addSubsetConstraint(from, prefixLen > fixedParamCount
+                        ? vp2.arrayUnknownVar(restArr)
+                        : vp2.objPropVar(restArr, String(pos - fixedParamCount)));
+                    this.solver.addTokenConstraint(restArr, vp2.nodeVar(restParam));
+                }
+                if (argumentsToken) // 'arguments' index also shifts by prefixLen; conflate
+                    this.solver.addSubsetConstraint(from, vp2.arrayUnknownVar(argumentsToken));
+            });
+            fanOutTail(vp.arrayUnknownVar(tailArray)); // unknown-index bucket stays conservative
+        } else if (tailVar)
+            fanOutTail(tailVar);
         // constraint: ...: t_arguments ∈ ⟦t_arguments⟧ if the function uses 'arguments'
         if (argumentsToken)
             this.solver.addTokenConstraint(argumentsToken, vp.argumentsVar(t.fun));
@@ -599,8 +685,8 @@ export class Operations {
             if (!f.externalCallbacksProcessed.has(at)) {
                 f.externalCallbacksProcessed.add(at);
                 for (const param of at.fun.params)
-                    if (isIdentifier(param)) // TODO: non-identifier parameters?
-                        this.solver.addAccessPath(UnknownAccessPath.instance, f.varProducer.nodeVar(param));
+                    forEachPatternIdentifier(param, id =>
+                        this.solver.addAccessPath(UnknownAccessPath.instance, f.varProducer.nodeVar(id)));
                 this.solver.addAccessPath(UnknownAccessPath.instance, f.varProducer.thisVar(at.fun));
                 // TODO: handle 'this' under --newobj?
             }
@@ -760,12 +846,15 @@ export class Operations {
         this.solver.addSubsetConstraint(this.solver.varProducer.objPropVar(t, prop), dst); // TODO: exclude AccessPathTokens?
 
         // constraint: ... ∀ functions t3 ∈ ⟦(get)t.p⟧: ⟦ret_t3⟧ ⊆ ⟦E.p⟧ (unless global native, [[Prototype]], "prototype", "toString", or array index)
+        // (the getter listeners are registered lazily, only if some getter actually appears, since t.p usually has no getter)
         if (!isGlobalNative(t) && !isUnlikelyGetterSetter(prop)) {
             const getter = this.solver.varProducer.objPropVar(t, prop, "get");
-            this.solver.addForAllTokensConstraint(getter, TokenListener.READ_GETTER, dstkey,
-                (t3: Token) => readFromGetter(t3));
-            this.solver.addForAllTokensConstraint(getter, TokenListener.READ_GETTER_THIS, {t: thist},
-                (t3: Token) => bindGetterThis(thist, t3));
+            this.solver.addIfNonEmptyConstraint(getter, () => {
+                this.solver.addForAllTokensConstraint(getter, TokenListener.READ_GETTER, dstkey,
+                    (t3: Token) => readFromGetter(t3));
+                this.solver.addForAllTokensConstraint(getter, TokenListener.READ_GETTER_THIS, {t: thist},
+                    (t3: Token) => bindGetterThis(thist, t3));
+            });
         }
 
         if (t instanceof ArrayToken) {
@@ -830,9 +919,12 @@ export class Operations {
                     this.solver.addForAllAncestorsConstraint(base, TokenListener.WRITE_ANCESTORS, {n: node, s: prop}, (anc: Token) => {
                         if (isObjectPropertyVarObj(anc)) {
                             // constraint: ...: ∀ functions t2 ∈ ⟦(set)anc.p⟧: ⟦E2⟧ ⊆ ⟦x⟧ where x is the parameter of t2
+                            // (the setter listeners are registered lazily, only if some setter actually appears, since anc.p usually has no setter)
                             const setter = this.solver.varProducer.objPropVar(anc, prop, "set");
-                            this.solver.addForAllTokensConstraint(setter, TokenListener.WRITE_SETTER, {n: node, s: prop}, writeToSetter);
-                            this.solver.addForAllTokensConstraint(setter, TokenListener.WRITE_SETTER_THIS, {t: base}, bindSetterThis);
+                            this.solver.addIfNonEmptyConstraint(setter, () => {
+                                this.solver.addForAllTokensConstraint(setter, TokenListener.WRITE_SETTER, {n: node, s: prop}, writeToSetter);
+                                this.solver.addForAllTokensConstraint(setter, TokenListener.WRITE_SETTER_THIS, {t: base}, bindSetterThis);
+                            });
                         }
                     });
 
@@ -933,7 +1025,7 @@ export class Operations {
 
             // X = E
             // constraint: ⟦E⟧ ⊆ ⟦X⟧
-            const lVar = vp.identVar(dst, path);
+            const lVar = vp.identVar(dst, path, "write");
             this.solver.addSubsetConstraint(src, lVar);
 
         } else if (isMemberExpression(dst) || isOptionalMemberExpression(dst)) {
@@ -1069,36 +1161,71 @@ export class Operations {
      */
     readIteratorValue(src: ConstraintVar | undefined, dst: ConstraintVar, node: Node) {
         this.solver.addForAllTokensConstraint(src, TokenListener.READ_ITERATOR_VALUE, node, (t: Token) => {
-            const vp = this.solver.varProducer;
-            if (t instanceof AllocationSiteToken)
-                switch (t.kind) {
-                    case "Array":
-                        this.solver.addSubsetConstraint(vp.arrayAllVar(t), dst);
-                        break;
-                    case "Set":
-                        this.solver.addSubsetConstraint(vp.objPropVar(t, SET_VALUES), dst);
-                        break;
-                    case "Map":
-                        const pair = this.newArrayToken(node);
-                        this.solver.addTokenConstraint(pair, dst);
-                        this.solver.addSubsetConstraint(vp.objPropVar(t, MAP_KEYS), vp.objPropVar(pair, "0"));
-                        this.solver.addSubsetConstraint(vp.objPropVar(t, MAP_VALUES), vp.objPropVar(pair, "1"));
-                        break;
-                    case "Iterator":
-                    case "ArrayKeys": // see IteratorKind
-                    case "ArrayValues":
-                    case "ArrayEntries":
-                    case "SetValues":
-                    case "SetEntries":
-                    case "MapKeys":
-                    case "MapValues":
-                    case "MapEntries":
-                    case "Generator":
-                        this.solver.addSubsetConstraint(vp.objPropVar(t, "value"), dst);
-                        break;
-                } // TODO: also handle TypedArray (see also nativebuilder.ts:returnIterator)
+            if (t instanceof AllocationSiteToken) {
+                if (t.kind === "Array")
+                    this.solver.addSubsetConstraint(this.solver.varProducer.arrayAllVar(t), dst);
+                else
+                    this.readNonArrayIterable(t, dst, node);
+            }
             // TODO: also handle user-defined...
         });
+    }
+
+    /**
+     * Reads the values of a non-array iterable token `t` (Set/Map/generator/iterator) into `dst`.
+     * Arrays are left to callers, whose index handling differs ({@link readIteratorValue} conflates
+     * via arrayAll; {@link buildSpreadArray} preserves indices).
+     */
+    readNonArrayIterable(t: AllocationSiteToken, dst: ConstraintVar, node: Node) {
+        const vp = this.solver.varProducer;
+        switch (t.kind) {
+            case "Set":
+                this.solver.addSubsetConstraint(vp.objPropVar(t, SET_VALUES), dst);
+                break;
+            case "Map":
+                const pair = this.newArrayToken(node);
+                this.solver.addTokenConstraint(pair, dst);
+                this.solver.addSubsetConstraint(vp.objPropVar(t, MAP_KEYS), vp.objPropVar(pair, "0"));
+                this.solver.addSubsetConstraint(vp.objPropVar(t, MAP_VALUES), vp.objPropVar(pair, "1"));
+                break;
+            case "Iterator":
+            case "ArrayKeys": // see IteratorKind
+            case "ArrayValues":
+            case "ArrayEntries":
+            case "SetValues":
+            case "SetEntries":
+            case "MapKeys":
+            case "MapValues":
+            case "MapEntries":
+            case "Generator":
+                this.solver.addSubsetConstraint(vp.objPropVar(t, "value"), dst);
+                break;
+        } // TODO: also handle TypedArray (see also nativebuilder.ts:returnIterator)
+    }
+
+    /**
+     * Builds an order-preserving array-token copy `T` of the spread source `src` for precise
+     * trailing-spread forwarding (`bar(a, b, ...src)`), where `T[i]` is spread element `i`: array
+     * indices are copied verbatim, non-array iterables flow into `T`'s unknown-index slot (no positional
+     * info). Consumed in {@link callFunctionTokenBound}.
+     */
+    buildSpreadArray(src: ConstraintVar | undefined, node: Node): ArrayToken {
+        const t = this.newArrayToken(node);
+        this.solver.addForAllTokensConstraint(src, TokenListener.BUILD_SPREAD_ARRAY, node, (st: Token) => {
+            if (!(st instanceof AllocationSiteToken))
+                return;
+            const vp = this.solver.varProducer;
+            if (st.kind === "Array") {
+                // same isArrayIndex predicate as the consumer, so both agree on which props are indices
+                this.solver.addForAllArrayEntriesConstraint(st, TokenListener.BUILD_SPREAD_ARRAY_ENTRIES, node, (prop: string) => {
+                    const vp2 = this.solver.varProducer;
+                    this.solver.addSubsetConstraint(vp2.objPropVar(st, prop), vp2.objPropVar(t, prop));
+                });
+                this.solver.addSubsetConstraint(vp.arrayUnknownVar(st), vp.arrayUnknownVar(t));
+            } else
+                this.readNonArrayIterable(st, vp.arrayUnknownVar(t), node); // no positional info
+        });
+        return t;
     }
 
     /**

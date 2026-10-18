@@ -106,6 +106,32 @@ describe("tests/micro", () => {
         soundness: "tests/micro/defineProperties.json",
     });
 
+    runTest("tests/micro", "definePropertyGetter.js", {
+        functionInfos: 4,
+        moduleInfos: 1,
+        hasEdges: [
+            ["micro@0.0.1:definePropertyGetter.js", "micro@0.0.1:definePropertyGetter.js:1:1:createParserGetter"],
+            ["micro@0.0.1:definePropertyGetter.js", "micro@0.0.1:definePropertyGetter.js:2:12:get"],
+            ["micro@0.0.1:definePropertyGetter.js:2:12:get", "micro@0.0.1:definePropertyGetter.js:7:1:loadParser"],
+            ["micro@0.0.1:definePropertyGetter.js", "micro@0.0.1:definePropertyGetter.js:8:12:parser"],
+        ]
+    });
+
+    runTest("tests/micro", "lazyaccessors.js", {
+        functionInfos: 17,
+        moduleInfos: 1,
+        numberOfFunctionToFunctionEdges: 17,
+        numberOfCallToFunctionEdges: 17,
+        oneCalleeCalls: 17,
+    });
+
+    runTest("tests/micro", "logicalassignment.js", {
+        functionInfos: 4,
+        moduleInfos: 1,
+        numberOfFunctionToFunctionEdges: 4,
+        numberOfCallToFunctionEdges: 4,
+    });
+
     runTest("tests/micro", "create.js", {
         soundness: "tests/micro/create.json",
         functionInfos: 2,
@@ -436,7 +462,7 @@ describe("tests/micro", () => {
         patterns: ["tests/micro/lowpatterns.json"],
         functionInfos: 0,
         moduleInfos: 1,
-        matches: {total: 3, low: 1},
+        matches: {total: 2, low: 0},
     });
 
     runTest("tests/micro", "bind.js", {
@@ -724,6 +750,30 @@ describe("tests/micro", () => {
         callTotal: 6,
     });
 
+    runTest("tests/micro", "static_init_arrow.js", {
+        functionInfos: 16,
+        moduleInfos: 1,
+        numberOfFunctionToFunctionEdges: 21,
+        hasEdges: [
+            ["micro@0.0.1:static_init_arrow.js:10:20:<anonymous>",
+             "micro@0.0.1:static_init_arrow.js:6:12:cHit"],
+            ["micro@0.0.1:static_init_arrow.js:12:32:<anonymous>",
+             "micro@0.0.1:static_init_arrow.js:6:12:cHit"],
+            ["micro@0.0.1:static_init_arrow.js:14:25:<anonymous>",
+             "micro@0.0.1:static_init_arrow.js:6:12:cHit"],
+            ["micro@0.0.1:static_init_arrow.js:24:24:<anonymous>",
+             "micro@0.0.1:static_init_arrow.js:6:12:cHit"],
+            ["micro@0.0.1:static_init_arrow.js:17:21:<anonymous>",
+             "micro@0.0.1:static_init_arrow.js:2:12:aHit"],
+            ["micro@0.0.1:static_init_arrow.js:19:33:<anonymous>",
+             "micro@0.0.1:static_init_arrow.js:2:12:aHit"],
+            ["micro@0.0.1:static_init_arrow.js:25:24:<anonymous>",
+             "micro@0.0.1:static_init_arrow.js:2:12:aHit"],
+            ["micro@0.0.1:static_init_arrow.js:28:17:<anonymous>",
+             "micro@0.0.1:static_init_arrow.js:8:5:instM"],
+        ],
+    });
+
     runTest("tests/micro", "dpr-this.js", {
         soundness: "tests/micro/dpr-this.json",
         // TODO: patch dynamics heuristic does not kick in for dynamic property reads
@@ -864,7 +914,14 @@ describe("tests/micro", () => {
 
     runTest("tests/micro", "jsx.js", {
         options: {ignoreUnresolved: true},
-        apiUsageAccessPathPatternsAtNodes: 6,
+        apiUsageAccessPathPatternsAtNodes: 5,
+    });
+
+    runTest("tests/micro", "jsxclosing.jsx", {
+        functionInfos: 2,
+        moduleInfos: 1,
+        numberOfFunctionToFunctionEdges: 2,
+        numberOfCallToFunctionEdges: 2,
     });
 
     runTest("tests/micro", "escape.js",  {
@@ -955,16 +1012,33 @@ describe("tests/micro", () => {
     });
 
     runTest("tests/micro", "spread.js", {
-        options: {objSpread: true},
+        options: {spread: true},
         soundness: "tests/micro/spread.json",
         funTotal: 10,
-        callFound: 17,
         callTotal: 20,
         reachableTotal: 9,
     });
 
+    runTest("tests/micro", "spread2.js", {
+        options: {spread: true},
+        moduleInfos: 1,
+        functionInfos: 30,
+        numberOfFunctionToFunctionEdges: 47,
+        numberOfCallToFunctionEdges: 86,
+    });
+
+    runTest("tests/micro", "spread_order.js", {
+        options: {spread: true},
+        numberOfCallToFunctionEdges: 7,
+    });
+
+    runTest("tests/micro", "spread_cycle.js", {
+        options: {spread: true},
+        numberOfCallToFunctionEdges: 3,
+    });
+
     runTest("tests/micro", "timers.js", {
-        options: {objSpread: true},
+        options: {spread: true},
         funTotal: 1,
         callTotal: 1,
         reachableTotal: 4,

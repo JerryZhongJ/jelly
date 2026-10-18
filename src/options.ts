@@ -87,6 +87,17 @@ export const options: {
     eagerPropagation: boolean,
     interops: boolean,
     maxFileSize: number | undefined,
+    dataflowJson: string | undefined,
+    dataflowSource: string | undefined,
+    dataflowMaxDepth: number | undefined,
+    dataflowMaxNodes: number | undefined,
+    dataflowDirection: "forward" | "reverse" | "both" | undefined,
+    callEdgePriors: string | undefined,
+    inferTypes: boolean,
+    typeOf: string | undefined,
+    typesJson: string | undefined,
+    shapeMaxSteps: number,
+    shapeOf: string | undefined,
 } = {
     callgraphHtml: undefined,
     dataflowHtml: undefined,
@@ -164,6 +175,17 @@ export const options: {
     eagerPropagation: false,
     interops: true,
     maxFileSize: undefined,
+    dataflowJson: undefined,
+    dataflowSource: undefined,
+    dataflowMaxDepth: undefined,
+    dataflowMaxNodes: undefined,
+    dataflowDirection: undefined,
+    callEdgePriors: undefined,
+    inferTypes: false,
+    typeOf: undefined,
+    typesJson: undefined,
+    shapeMaxSteps: 100000,
+    shapeOf: undefined,
 };
 
 /**
@@ -191,6 +213,10 @@ export function setOptions(opts: OptionValues & Partial<typeof options>) {
     }
     if (options.apiUsage)
         options.ignoreDependencies = true;
+    if (options.typeOf)
+        options.inferTypes = true;
+    if (options.typesJson || options.shapeOf)
+        options.inferTypes = true;
     if (options.excludeEntries)
         options.excludeEntries =
             options.excludeEntries.length === 0 ? undefined : // micromatch bug workaround

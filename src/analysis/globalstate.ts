@@ -1,5 +1,5 @@
 import {statSync} from "fs";
-import {Function, Node} from "@babel/types";
+import {File, Function, Node} from "@babel/types";
 import {FilePath, getOrSet, Location, locationToStringWithFile, mapGetMap, strHash} from "../misc/util";
 import {
     AccessorType,
@@ -28,13 +28,18 @@ import {TSModuleResolver} from "../typescript/moduleresolver";
 import {ProcessManager} from "../approx/processmanager";
 import {Patching} from "../approx/patching";
 import {isDummyConstructor} from "../parsing/extras";
+import {TypeLabel, TypeLabelRegistry} from "./typelabels";
 import {getEnclosingFunction} from "../misc/asthelpers";
 import {Worklist} from "../misc/worklist";
+import {locKeyFromNode} from "./callEdgePriors";
 
 /**
  * Global analysis state.
  */
 export class GlobalState {
+
+    /** Analyzed ASTs retained only for the flow-sensitive shape post-pass. */
+    readonly shapePrograms: Map<ModuleInfo, File> = new Map;
 
     /**
      * Map from constraint variable string hash to canonical ConstraintVar object.
@@ -58,6 +63,53 @@ export class GlobalState {
      * Map from AST node to canonical NodeVar object.
      */
     readonly canonicalNodeVars: WeakMap<Node, NodeVar> = new WeakMap;
+
+    /**
+     * Map from "<relative file>:<startLine>:<startColumn(1-based)>" to the expression node and its
+     * constraint variable, filled during analysis via recordExpLocation (called from Operations.expVar).
+     * Lets the dataflow JSON reporter resolve an external source location (file:line:col) to a start
+     * constraint variable for forward may-flow traversal. For identifiers the variable is the
+     * declaration's (ConstraintVarProducer.expVar2 binds to the declaration node); the use-site key here
+     * reaches it.
+     */
+    readonly expLocationIndex: Map<string, {node: Node, v: ConstraintVar | undefined}> = new Map;
+
+    /**
+     * Registered primitive type labels for expressions (basic type inference).
+     */
+    readonly typeLabels = new TypeLabelRegistry;
+
+    /**
+     * Return type labels for global native functions, keyed by native token name
+     * (e.g. "Math.abs", "String.prototype.charAt"). Filled from the native models.
+     */
+    readonly nativeReturnTypes = new Map<string, TypeLabel>();
+
+    /**
+     * Map from function locKey (relative-to-basedir path + 1-based range) to the
+     * Function AST node, filled in registerFunctionInfo. Used by call-edge priors
+     * (force_include) to resolve a callee locKey to its Function for token injection.
+     */
+    readonly funLocIndex: Map<string, Function> = new Map;
+
+    /**
+     * Records an expression use-site location -> constraint variable mapping for the dataflow reporter.
+     * An existing entry with a variable is never overwritten by one without
+     * (e.g. the plus-rule result variable must survive a later expVar call
+     * returning undefined for the same expression).
+     */
+    recordExpLocation(node: Node, v: ConstraintVar | undefined) {
+        const loc = node.loc as Location | null;
+        if (loc && loc.module) {
+            // Key by full range, not just start point: nested expressions share a start
+            // (e.g. `a`, `a.b`, `a.b.c` all start where `a` does; `f` and `f(x)` too), so a
+            // start-only key would make later ones overwrite earlier ones in this Map.
+            const key = `${relative(options.basedir, loc.module.getPath())}:${loc.start.line}:${loc.start.column + 1}:${loc.end.line}:${loc.end.column + 1}`;
+            const existing = this.expLocationIndex.get(key);
+            if (!(existing && existing.v && !v))
+                this.expLocationIndex.set(key, {node, v});
+        }
+    }
 
     readonly vars: Array<ConstraintVar> = [];
 
@@ -262,6 +314,9 @@ export class GlobalState {
         const fun = path.node;
         const f = new FunctionInfo(name, fun.loc!, m, isDummyConstructor(fun));
         this.functionInfos.set(fun, f);
+        const funLK = locKeyFromNode(fun);
+        if (funLK)
+            this.funLocIndex.set(funLK, fun);
         const parent = getEnclosingFunction(path)?.node;
         (parent ? this.functionInfos.get(parent)!.functions : m.functions).add(f);
         this.vulnerabilities?.reachedFunction(f); // TODO: move to FragmentState?

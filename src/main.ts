@@ -34,6 +34,11 @@ import {compareCallGraphs} from "./output/compare";
 import {getMemoryLimit} from "./misc/memory";
 import Solver from "./analysis/solver";
 import {exportCallGraphHtml, exportDataFlowGraphHtml} from "./output/visualizer";
+import {dataflowToJSON} from "./output/dataflow";
+import {inferTypeAtLocation, propagateTypeLabels, reportTypeLabels} from "./analysis/typelabels";
+import {inferShapes} from "./analysis/shapeinfer";
+import {typesToJSON} from "./output/types";
+import {loadCallEdgePriors} from "./analysis/callEdgePriors";
 import {VulnerabilityDetector} from "./patternmatching/vulnerabilitydetector";
 import {Vulnerability} from "./typings/vulnerabilities";
 import {addAll} from "./misc/util";
@@ -107,6 +112,17 @@ program
     .option("--max-waves <number>", "limit number of fixpoint waves", parsePositiveInt)
     .option("--max-indirections <number>", "limit number of function call and property write indirections", parsePositiveInt)
     .option("--full-indirection-bounding", "enable indirection bounding for method calls and property reads (use with --max-indirections)")
+    .option("--dataflow-json <file>", "save forward dataflow reachability from --dataflow-source as JSON file")
+    .option("--dataflow-source <location>", "source expression location file:line:col(1-based) for --dataflow-json")
+    .option("--dataflow-max-depth <n>", "dataflow BFS depth bound", parsePositiveInt)
+    .option("--dataflow-max-nodes <n>", "dataflow BFS visited nodes bound", parsePositiveInt)
+    .option("--dataflow-direction <dir>", "dataflow direction: forward|reverse|both (default both)")
+    .option("--call-edge-priors <file>", "JSON of force_include/force_exclude call edge priors (locKey-based)")
+    .option("--infer-types", "infer basic types (number/string/object/...) via type-label propagation")
+    .option("--type-of <location>", "report inferred basic type of the expression at file:line:col (1-based), enables --infer-types")
+    .option("--types-json <file>", "save inferred types for all labeled expressions as JSON file, enables --infer-types")
+    .option("--shape-max-steps <n>", "forward shape analysis visit budget (default 100000)", parsePositiveInt)
+    .option("--shape-of <location>", "query token shapes after the expression at file:line:col (1-based), enables --infer-types")
     .option("--typescript-library-usage <file>", "save TypeScript library usage in JSON file, no analysis")
     .option("--modules-only", "report reachable packages and modules only, no analysis")
     .option("--compare-callgraphs", "compare two call graphs given as JSON files, no analysis")
@@ -348,6 +364,14 @@ async function main() {
             const a = solver.globalState;
             a.vulnerabilities = vulnerabilityDetector;
             solver.diagnostics.vulnerabilities = vulnerabilityDetector?.diagnostics;
+            if (options.callEdgePriors) {
+                try {
+                    solver.fragmentState.callEdgePriors = loadCallEdgePriors(JSON.parse(readFileSync(options.callEdgePriors, "utf8")));
+                    logger.info(`Loaded call-edge priors from ${options.callEdgePriors}`);
+                } catch (e) {
+                    logger.warn(`Failed to load call-edge priors from ${options.callEdgePriors}: ${(e as Error).message}`);
+                }
+            }
             await analyzeFiles(files, solver);
             const f = solver.fragmentState;
             const out = new AnalysisStateReporter(f);
@@ -372,6 +396,54 @@ async function main() {
                 const file = options.dataflowHtml;
                 exportDataFlowGraphHtml(f, file); // TODO: also show pattern matches and reachability
                 logger.info(`Data-flow graph written to ${file}`);
+            }
+
+            if (options.dataflowJson) {
+                const report = dataflowToJSON(f, options.dataflowSource, solver.diagnostics, {
+                    maxDepth: options.dataflowMaxDepth,
+                    maxNodes: options.dataflowMaxNodes,
+                    direction: options.dataflowDirection as "forward" | "reverse" | "both" | undefined,
+                });
+                writeFileSync(options.dataflowJson, JSON.stringify(report, undefined, 2));
+                logger.info(
+                    `Dataflow${options.dataflowSource ? ` from ${options.dataflowSource}` : ""} written to ${options.dataflowJson}`
+                    + ` (${report.nodes.length} nodes, ${report.edges.length} edges)`,
+                );
+            }
+
+            if (options.inferTypes || options.typeOf) {
+                const labels = propagateTypeLabels(f);
+                if (options.typeOf) {
+                    const r = inferTypeAtLocation(f, labels, options.typeOf);
+                    if (!r.resolved)
+                        logger.warn(`No constraint variable for expression at ${options.typeOf}`);
+                    else {
+                        const nodeType = (r.node as any)?.type;
+                        console.log(`Type at ${options.typeOf}: ${r.types.length ? r.types.join("|") : "unknown"}` +
+                            (r.propagated.length ? ` (labels: ${r.propagated.join("|")})` : "") +
+                            (r.fromTokens.length ? ` (tokens: ${r.fromTokens.join("|")})` : "") +
+                            (nodeType ? ` [${nodeType}]` : ""));
+                    }
+                }
+                if (options.typesJson || options.shapeOf) {
+                    const shapes = inferShapes(f, labels, options.shapeMaxSteps, options.shapeOf ? [options.shapeOf] : undefined);
+                    if (options.shapeOf) {
+                        if (!shapes.states.length) logger.warn(`No object observation at ${options.shapeOf}`);
+                        for (const state of shapes.states) {
+                            const shape = shapes.shapes.find(s => s.name === state.shape);
+                            console.log(`Shape at ${state.location} (${state.phase}, ${state.token}): ` +
+                                (shape ? `Known(${shape.properties.map(p => p.name).join(", ")})` : `Unknown(${state.reason})`));
+                        }
+                    }
+                    if (options.typesJson) {
+                        const report = typesToJSON(f, labels, shapes);
+                        writeFileSync(options.typesJson, JSON.stringify(report, undefined, 2));
+                        logger.info(`Types report written to ${options.typesJson} (${report.entries.length} expressions, `
+                            + `${report.shapes?.length ?? 0} shapes, ${report.shapeBindings?.length ?? 0} bindings, ${report.shapeGuards?.length ?? 0} guards)`);
+                    }
+                }
+                if (options.inferTypes && !options.typesJson && !options.typeOf && !options.shapeOf)
+                    reportTypeLabels(f, labels); // human-readable fallback summary
             }
 
             if (options.callgraphGraphviz) {

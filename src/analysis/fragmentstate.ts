@@ -16,6 +16,7 @@ import assert from "assert";
 import {
     addMapHybridSet,
     getOrSet,
+    Location,
     locationToStringWithFile,
     locationToStringWithFileAndEnd,
     mapGetMap,
@@ -34,6 +35,7 @@ import {NodePath} from "@babel/traverse";
 import {GlobalState} from "./globalstate";
 import {ConstraintVarProducer} from "./constraintvarproducer";
 import Solver from "./solver";
+import {isCallExcluded, locKeyFromLoc, locKeyFromNode, type Priors} from "./callEdgePriors";
 import {MaybeEmptyPropertyRead} from "../patching/patchdynamics";
 import {getEnclosingNonArrowFunction, isInTryBlockOrBranch} from "../misc/asthelpers";
 import {isAbsoluteModuleName, isLocalRequire, resolveModule} from "../misc/files";
@@ -169,6 +171,18 @@ export class FragmentState {
      * Map from call node to constraint variable(s) that represent the callees.
      */
     readonly callToCalleeVars: Map<Node, Set<ConstraintVar>> = new Map; // TODO: use singleton/set?
+
+    /**
+     * Call-edge priors (force_include / force_exclude), loaded from --call-edge-priors.
+     * Undefined when no priors file is given.
+     */
+    callEdgePriors: Priors | undefined = undefined;
+
+    /**
+     * callsite locKey -> call Node, filled in registerCall. Used by force_include
+     * (applyPendingForceIncludes) to resolve a callsite locKey to its Node / calleeVar.
+     */
+    readonly callLocIndex: Map<string, Node> = new Map;
 
     /**
      * Map from require/import call to the set of modules being required. (For output only.)
@@ -324,6 +338,13 @@ export class FragmentState {
     propertyReads: Array<{base: ConstraintVar, prop: string, node: Node, encl: FunctionInfo | ModuleInfo}> = [];
 
     /**
+     * Property writes (symmetric counterpart to propertyReads for the dataflow reporter).
+     * `dst` is the object-property variable written to (the target of the ⟦E2⟧ ⊆ ⟦base.p⟧ subset edge);
+     * `prop` is undefined for dynamic writes E[k]=V where the property name is unknown.
+     */
+    propertyWrites: Array<{src: ConstraintVar | undefined, dst: ConstraintVar, prop: string | undefined, node: Node, encl: FunctionInfo | ModuleInfo}> = [];
+
+    /**
      * Property reads that may have empty result.
      * Used by patchDynamics.
      */
@@ -376,6 +397,11 @@ export class FragmentState {
      */
     registerCallEdge(call: Node, from: FunctionInfo | ModuleInfo, to: FunctionInfo,
                      {native, accessor, external}: {native?: boolean, accessor?: boolean, external?: boolean} = {}) {
+        // force_exclude: drop the edge before it enters the call graph. registerCallEdge is the
+        // single chokepoint for all 11 edge-producing paths (including finalization.ts:33/73 backfill),
+        // so one check here keeps the edge out of functionToFunction / callToFunction / callToFunctionOrModule.
+        if (isCallExcluded(this.callEdgePriors, locKeyFromNode(call), locKeyFromLoc(to.loc as Location)))
+            return;
         if ((!accessor || options.callgraphImplicit) &&
             (!native || options.callgraphNative) &&
             (!external || options.callgraphExternal)) {
@@ -407,6 +433,9 @@ export class FragmentState {
         calleeVar: ConstraintVar | undefined,
         {native, external, accessor}: {native?: boolean, external?: boolean, accessor?: boolean} = {}
     ) {
+        const clk = locKeyFromNode(n);
+        if (clk)
+            this.callLocIndex.set(clk, n);
         if (accessor && !options.callgraphImplicit)
             return;
         if (!this.callLocations.has(n) ||
@@ -551,6 +580,17 @@ export class FragmentState {
             this.maybeEmptyPropertyReads.push({typ, base, prop});
         if (base && prop)
             this.propertyReads.push({base, prop, node, encl});
+    }
+
+    /**
+     * Registers a property write operation (symmetric counterpart to registerPropertyRead).
+     * Used by the dataflow reporter to classify store-property edges with source locations.
+     */
+    registerPropertyWrite(
+        src: ConstraintVar | undefined, dst: ConstraintVar, prop: string | undefined,
+        node: Node, encl: FunctionInfo | ModuleInfo
+    ) {
+        this.propertyWrites.push({src, dst, prop, node, encl});
     }
 
     /**

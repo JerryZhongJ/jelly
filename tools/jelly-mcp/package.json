@@ -1,0 +1,20 @@
+{
+  "name": "jelly-mcp",
+  "private": true,
+  "version": "0.0.1",
+  "description": "MCP server prototype wrapping Jelly call graph browsing, manual edge overrides and heat estimation. Tools-layer only: consumes Jelly call-graph JSON, no changes to Jelly core.",
+  "bin": {
+    "jelly-mcp": "src/index.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "@babel/parser": "^7.28.5",
+    "@babel/traverse": "^7.28.5"
+  }
+}

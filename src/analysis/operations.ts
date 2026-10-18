@@ -4,6 +4,9 @@ import {
     Identifier,
     isArrayPattern,
     isAssignmentPattern,
+    isBigIntLiteral,
+    isBinaryExpression,
+    isBooleanLiteral,
     isExportAllDeclaration,
     isExportDeclaration,
     isExpression,
@@ -12,14 +15,20 @@ import {
     isLVal,
     isMemberExpression,
     isMetaProperty,
+    isNullLiteral,
+    isNumericLiteral,
     isObjectPattern,
     isOptionalMemberExpression,
     isParenthesizedExpression,
     isRestElement,
     isSpreadElement,
+    isStringLiteral,
     isSuper,
+    isTemplateLiteral,
     isTSParameterProperty,
     isTypeCastExpression,
+    isUnaryExpression,
+    isUpdateExpression,
     isVoidPattern,
     JSXElement,
     JSXIdentifier,
@@ -32,6 +41,7 @@ import {
     TypeCastExpression
 } from "@babel/types";
 import {NodePath} from "@babel/traverse";
+import {isCallExcluded, locKeyFromNode} from "./callEdgePriors";
 import {
     getAdjustedCallNodePath,
     getConstantString,
@@ -71,6 +81,7 @@ import {
 } from "./accesspaths";
 import Solver, {ListenerKey} from "./solver";
 import {GlobalState} from "./globalstate";
+import {TypeLabel} from "./typelabels";
 import {DummyModuleInfo, FunctionInfo, ModuleInfo, normalizeModuleName} from "./infos";
 import logger from "../misc/logger";
 import {options} from "../options";
@@ -134,7 +145,26 @@ export class Operations {
      * Also adds @Unknown and a subset constraint for globalThis.E if the given expression E is an implicitly declared global variable.
      */
     expVar(exp: Expression | JSXIdentifier | JSXMemberExpression | JSXNamespacedName, path: NodePath): ConstraintVar | undefined {
-        const {v, unbound} = this.solver.varProducer.expVar2(exp, path);
+        let {v, unbound} = this.solver.varProducer.expVar2(exp, path);
+
+        // basic type inference: give primitive-valued expressions a variable with a type label
+        if (!v && options.inferTypes) {
+            const label = getPrimitiveTypeLabel(exp);
+            if (label || hasArithRule(exp)) {
+                // also for rule-based arithmetic expressions: the variable carries no
+                // initial label but connects the rule result to assignment flows
+                // (e.g. `let c = a + b`)
+                const nv = this.solver.varProducer.nodeVar(exp as Node);
+                v = nv;
+                if (label) {
+                    this.a.typeLabels.register(exp as Node, label);
+                    this.a.typeLabels.expVars.set(exp as Node, nv);
+                }
+            }
+        }
+
+        // record use-site location -> variable for the dataflow JSON reporter
+        this.a.recordExpLocation(exp as Node, v);
 
         // if the expression is a variable that has not been declared normally and is not a native global...
         if (unbound && !this.a.globalSpecialNatives![(exp as Identifier | JSXIdentifier).name]) {
@@ -144,6 +174,38 @@ export class Operations {
             this.solver.addAccessPath(UnknownAccessPath.instance, v);
         }
         return v;
+    }
+
+    /**
+     * Basic type inference: registers an arithmetic rule so the labels of L op R
+     * (or op L / L++ for unary rules, see registerUnaryArith) flow to the result
+     * variable during type-label propagation.
+     */
+    registerArith(op: string, resultNode: Node, left: Expression, right: Expression, path: NodePath) {
+        if (!options.inferTypes)
+            return;
+        const l = this.expVar(left, path);
+        const r = this.expVar(right, path);
+        const result = this.solver.varProducer.nodeVar(resultNode);
+        this.a.recordExpLocation(resultNode, result); // make the result expression queryable
+        this.a.typeLabels.registerArith(op, result, l, r);
+    }
+
+    /**
+     * Basic type inference: registers a unary arithmetic rule (operators "-",
+     * "~", "++", "--") so the labels of op L flow to the result variable during
+     * type-label propagation. If alsoAssignTo is given (the updated variable of
+     * an UpdateExpression), the same labels flow there, too.
+     */
+    registerUnaryArith(op: string, resultNode: Node, operand: Expression, path: NodePath, alsoAssignTo?: ConstraintVar) {
+        if (!options.inferTypes)
+            return;
+        const l = this.expVar(operand, path);
+        const result = this.solver.varProducer.nodeVar(resultNode);
+        this.a.recordExpLocation(resultNode, result); // make the result expression queryable
+        this.a.typeLabels.registerArith(op, result, l, undefined);
+        if (alsoAssignTo)
+            this.a.typeLabels.registerArith(op, alsoAssignTo, l, undefined);
     }
 
     private getRequireHints(pars: NodePath): Array<string> | undefined {
@@ -284,6 +346,20 @@ export class Operations {
         // expression E0(E1,...,En) or new E0(E1,...,En)
         // constraint: ∀ functions t ∈ ⟦E0⟧: ...
         this.solver.addForAllTokensConstraint(calleeVar, key, path.node, (t: Token) => handleCall(undefined, t));
+
+        // force_include: inject target FunctionTokens for include rules on this callsite whose callee is already
+        // analyzed. Rules whose callee resolves later are retried by analyzer.ts before each propagate via
+        // applyPendingForceIncludes. addTokenConstraint is idempotent (solver token dedup).
+        if (calleeVar) {
+            const clk = locKeyFromNode(pars.node);
+            const priors = f.callEdgePriors;
+            if (clk && priors)
+                for (const rule of priors.byCallsite.get(clk) ?? []) {
+                    const fun = this.a.funLocIndex.get(rule.callee);
+                    if (fun)
+                        this.solver.addTokenConstraint(this.a.canonicalizeToken(new FunctionToken(fun)), calleeVar);
+                }
+        }
         // this looks odd for method calls (E0.p(E1,...,En)), but ⟦E0.p⟧ is empty for method calls
         // (see the special case for visitMemberExpression in astvisitor.ts)
         // the constraint is used for method calls when:
@@ -376,6 +452,17 @@ export class Operations {
                     globalSpecialNatives: this.globalSpecialNatives,
                 });
 
+            // basic type inference: native return-type model, or the conservative
+            // "unknown" fallback for natives with no model at all (their result would
+            // otherwise be invisible to the label propagation, yielding spurious singleton types)
+            if (options.inferTypes && resultVar && !isNew) {
+                const rt = t.moduleInfo === undefined ? this.a.nativeReturnTypes.get(t.name) : undefined;
+                if (rt !== undefined)
+                    this.a.typeLabels.registerVarLabel(resultVar, rt);
+                else if (!t.invoke)
+                    this.a.typeLabels.registerVarLabel(resultVar, "unknown");
+            }
+
             if (t.name === "require") {
 
                 // require(...)
@@ -451,6 +538,9 @@ export class Operations {
         const f = this.solver.fragmentState; // (don't use in callbacks)
         const vp = f.varProducer;
         const pars = getAdjustedCallNodePath(path);
+        // force_exclude: skip this callee's full call modeling (args/this/return/edge).
+        if (isCallExcluded(f.callEdgePriors, locKeyFromNode(pars.node), locKeyFromNode(t.fun)))
+            return;
         f.registerCallEdge(pars.node, caller, this.a.functionInfos.get(t.fun)!, kind);
         const argumentsToken = f.functionsWithArguments.has(t.fun) ? this.a.canonicalizeToken(new ArrayToken(t.fun.body)) : undefined;
         for (const [i, arg] of args.entries()) {
@@ -653,8 +743,12 @@ export class Operations {
         thist: Token = t
     ) {
         const readFromGetter = (t: Token) => {
-            if (t instanceof FunctionToken && t.fun.params.length === 0)
+            if (t instanceof FunctionToken && t.fun.params.length === 0) {
+                // force_exclude: skip this getter's return-value flow (callsite = the property-read node in dstkey).
+                if (isCallExcluded(this.solver.fragmentState.callEdgePriors, locKeyFromNode((dstkey as any).n), locKeyFromNode(t.fun)))
+                    return;
                 this.solver.addSubsetConstraint(this.solver.varProducer.returnVar(t.fun), dst);
+            }
         };
 
         const bindGetterThis = (baset: Token, t: Token) => {
@@ -702,6 +796,9 @@ export class Operations {
     ) {
         const writeToSetter = (t: Token) => {
             if (t instanceof FunctionToken && t.fun.params.length === 1) {
+                // force_exclude: skip this setter's argument flow, call registration and edge.
+                if (isCallExcluded(this.solver.fragmentState.callEdgePriors, locKeyFromNode(node), locKeyFromNode(t.fun)))
+                    return;
                 this.solver.addSubsetConstraint(src, this.solver.varProducer.nodeVar(t.fun.params[0]));
                 this.solver.fragmentState.registerCall(node, enclosing, undefined, {accessor: true});
                 this.solver.fragmentState.registerCallEdge(node, enclosing, this.a.functionInfos.get(t.fun)!, {accessor: true});
@@ -721,8 +818,11 @@ export class Operations {
             }
 
             // constraint: ...: ⟦E2⟧ ⊆ ⟦base.p⟧
+            const dstVar = this.solver.varProducer.objPropVar(base, prop, ac);
             if (src)
-                this.solver.addSubsetConstraint(src, this.solver.varProducer.objPropVar(base, prop, ac));
+                this.solver.addSubsetConstraint(src, dstVar);
+            // record store-property edge source location for the dataflow reporter
+            this.solver.fragmentState.registerPropertyWrite(src, dstVar, prop, node, enclosing);
 
             if (invokeSetters)
                 // constraint: ... ∀ ancestors anc of base: ... (unless global native, [[Prototype]], "prototype", "toString" or array index)
@@ -1078,4 +1178,83 @@ function isUnlikelyGetterSetter(prop: string): boolean {
  */
 export function isGlobalNative(t: Token): boolean {
     return t instanceof NativeObjectToken && t.moduleInfo === undefined && t.name !== "globalThis";
+}
+
+/**
+ * The binary operators whose result labels are computed by arithJoin during
+ * propagation (registered as rules by the AST visitor) instead of a syntactic label.
+ */
+const ARITH_BINARY_OPS = new Set(["+", "-", "*", "/", "%", "**", "&", "|", "^", "<<", ">>", ">>>"]);
+
+/**
+ * Returns true if the expression's result labels are computed by an arithmetic
+ * rule (see registerArith / registerUnaryArith) rather than a syntactic label.
+ */
+export function hasArithRule(exp: Expression | JSXIdentifier | JSXMemberExpression | JSXNamespacedName): boolean {
+    if (isBinaryExpression(exp))
+        return ARITH_BINARY_OPS.has(exp.operator);
+    if (isUnaryExpression(exp))
+        return exp.operator === "-" || exp.operator === "~";
+    if (isUpdateExpression(exp))
+        return true;
+    return false;
+}
+
+/**
+ * Returns the basic type label for an expression whose value is a primitive with a
+ * syntactically known type (or undefined if unknown). Used for basic type inference;
+ * mirrors the literal cases skipped by ConstraintVarProducer.expVar2.
+ * The arithmetic/bitwise/shift binary operators, unary '-'/'~' and update
+ * expressions return undefined here: their labels are operator- and
+ * operand-dependent (number vs bigint per the ES spec ToNumeric/ToBigInt
+ * conversions) and computed by arithJoin/unaryArithJoin rules instead.
+ */
+export function getPrimitiveTypeLabel(exp: Expression | JSXIdentifier | JSXMemberExpression | JSXNamespacedName): TypeLabel | undefined {
+    while (isParenthesizedExpression(exp))
+        exp = exp.expression;
+    if (isIdentifier(exp) && exp.name === "undefined")
+        return "undefined"; // only reached when 'undefined' has no local binding (expVar2 returns early otherwise)
+    if (isStringLiteral(exp) || isTemplateLiteral(exp))
+        return "string";
+    if (isNumericLiteral(exp))
+        return "number";
+    if (isBigIntLiteral(exp))
+        return "bigint";
+    if (isBooleanLiteral(exp))
+        return "boolean";
+    if (isNullLiteral(exp))
+        return "null";
+    if (isUnaryExpression(exp))
+        switch (exp.operator) {
+            case "!":
+                return "boolean";
+            case "void":
+                return "undefined";
+            case "typeof":
+                return "string";
+            case "+":
+                return "number"; // unary '+' is always ToNumber (BigInt operands throw)
+            case "-":
+            case "~":
+                return undefined; // number or bigint, depending on the operand (rule-based)
+        }
+    if (isBinaryExpression(exp))
+        switch (exp.operator) {
+            case "==":
+            case "!=":
+            case "===":
+            case "!==":
+            case "<":
+            case "<=":
+            case ">":
+            case ">=":
+            case "in":
+            case "instanceof":
+                return "boolean"; // comparisons always produce booleans
+            default: // arithmetic/bitwise/shift operators: number or bigint (rule-based)
+                return undefined;
+        }
+    if (isUpdateExpression(exp))
+        return undefined; // number or bigint, depending on the operand (rule-based)
+    return undefined;
 }

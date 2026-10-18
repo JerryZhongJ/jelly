@@ -2,7 +2,7 @@ import {CallExpression, Expression, Identifier, NewExpression, OptionalCallExpre
 import Solver from "../analysis/solver";
 import {NativeObjectToken} from "../analysis/tokens";
 import {ModuleInfo} from "../analysis/infos";
-import {ecmascriptModels} from "./ecmascript";
+import {ecmascriptModels, nativeReturnTypes as ecmascriptReturnTypes} from "./ecmascript";
 import {NodePath} from "@babel/traverse";
 import {nodejsModels} from "./nodejs";
 import {options} from "../options";
@@ -81,6 +81,12 @@ export function buildGlobalNatives(solver: Solver): SpecialNativeObjects {
 
     const models = [ecmascriptModels, nodejsModels];
     for (const m of models) {
+
+        // basic type inference: register native return type labels (global natives only,
+        // module-specific native token names are not globally unique)
+        if (m.name === "ecmascript")
+            for (const [name, label] of Object.entries(ecmascriptReturnTypes))
+                a.nativeReturnTypes.set(name, label);
 
         /**
          * Adds an identifier to the global scope.

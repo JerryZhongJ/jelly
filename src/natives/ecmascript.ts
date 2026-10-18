@@ -54,6 +54,7 @@ import {NativeFunctionParams, NativeModel, NativeModelParams} from "./nativebuil
 import {TokenListener} from "../analysis/listeners";
 import {options} from "../options";
 import {getConstantString} from "../misc/asthelpers";
+import {TypeLabel} from "../analysis/typelabels";
 
 export const OBJECT_PROTOTYPE = "Object.prototype";
 export const ARRAY_PROTOTYPE = "Array.prototype";
@@ -129,6 +130,89 @@ export function isNativeMethod(t: Token, prop: string, dummyOnly: boolean = fals
     const ms = METHODS.get(kind);
     return Boolean(ms?.has(prop) && (!dummyOnly || ms.get(prop) === undefined));
 }
+
+/**
+ * Basic return type labels for global native functions, keyed by native token
+ * name. This is the precise layer of native return-type modeling: a listed
+ * function contributes the label to its call result. Natives that are neither
+ * listed here nor have an invoke model get the conservative "unknown" fallback
+ * at the call site (see Operations.callFunctionToken... the NativeObjectToken
+ * branch in operations.ts).
+ * Only add entries whose return basic type is fixed by the ECMAScript spec.
+ */
+export const nativeReturnTypes: Record<string, TypeLabel> = {
+    // global functions
+    "isFinite": "boolean",
+    "isNaN": "boolean",
+    "parseFloat": "number",
+    "parseInt": "number",
+    "eval": "unknown", // may return anything
+    // classes called as functions (plain call, not 'new' - the call site gates on !isNew)
+    "BigInt": "bigint",
+    "Boolean": "boolean",
+    "Number": "number",
+    "String": "string",
+    "Symbol": "symbol",
+    "Date": "string", // Date() called without 'new' returns a string
+    // Math.* (all return numbers)
+    ...Object.fromEntries(["abs", "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cbrt", "ceil",
+        "clz32", "cos", "cosh", "exp", "expm1", "floor", "fround", "hypot", "imul", "log", "log10", "log1p",
+        "log2", "max", "min", "pow", "random", "round", "sign", "sin", "sinh", "sqrt", "tan", "tanh", "trunc"]
+        .map(m => [`Math.${m}`, "number" as const])),
+    // JSON
+    "JSON.stringify": "string",
+    // Array statics
+    "Array.isArray": "boolean",
+    "Array.from": "array",
+    "Array.of": "array",
+    // Object.prototype
+    "Object.prototype.hasOwnProperty": "boolean",
+    "Object.prototype.propertyIsEnumerable": "boolean",
+    "Object.prototype.isPrototypeOf": "boolean",
+    // RegExp.prototype
+    "RegExp.prototype.test": "boolean",
+    // String statics
+    "String.fromCharCode": "string",
+    "String.fromCodePoint": "string",
+    "String.raw": "string",
+    // Number statics
+    "Number.isFinite": "boolean",
+    "Number.isInteger": "boolean",
+    "Number.isNaN": "boolean",
+    "Number.isSafeInteger": "boolean",
+    "Number.parseFloat": "number",
+    "Number.parseInt": "number",
+    // Number.prototype
+    "Number.prototype.toFixed": "string",
+    "Number.prototype.toPrecision": "string",
+    // String.prototype: string-returning
+    ...Object.fromEntries(["charAt", "concat", "normalize", "padEnd", "padStart", "repeat", "replace", "replaceAll",
+        "slice", "substr", "substring", "toLocaleLowerCase", "toLocaleUpperCase", "toLowerCase", "toString",
+        "toUpperCase", "trim", "trimEnd", "trimStart", "valueOf"].map(m => [`String.prototype.${m}`, "string" as const])),
+    // String.prototype: number-returning (may be NaN/-1, still number)
+    ...Object.fromEntries(["charCodeAt", "codePointAt", "indexOf", "lastIndexOf", "search"]
+        .map(m => [`String.prototype.${m}`, "number" as const])),
+    // String.prototype: boolean-returning
+    ...Object.fromEntries(["endsWith", "includes", "startsWith"].map(m => [`String.prototype.${m}`, "boolean" as const])),
+    // String.prototype: array-or-null returning (the label breaks wrong singletons; array guards are never emitted)
+    ...Object.fromEntries(["match", "matchAll", "split"].map(m => [`String.prototype.${m}`, "array" as const])),
+    // Array.prototype
+    ...Object.fromEntries(["every", "includes", "some"].map(m => [`Array.prototype.${m}`, "boolean" as const])),
+    ...Object.fromEntries(["findIndex", "indexOf", "lastIndexOf", "push"]
+        .map(m => [`Array.prototype.${m}`, "number" as const])),
+    "Array.prototype.join": "string",
+    // Date statics and Date.prototype number/string getters
+    "Date.now": "number",
+    ...Object.fromEntries(["getDate", "getDay", "getFullYear", "getHours", "getMilliseconds", "getMinutes",
+        "getMonth", "getSeconds", "getTime", "valueOf"].map(m => [`Date.prototype.${m}`, "number" as const])),
+    "Date.prototype.toISOString": "string",
+    "Date.prototype.toJSON": "string",
+    // Map/Set
+    "Map.prototype.has": "boolean",
+    "Set.prototype.has": "boolean",
+    "WeakMap.prototype.has": "boolean",
+    "WeakSet.prototype.has": "boolean",
+};
 
 /*
  * Models of ECMAScript standard built-in objects.

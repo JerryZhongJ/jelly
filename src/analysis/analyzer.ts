@@ -17,6 +17,7 @@ import {preprocessAst} from "../parsing/extras";
 import {patchDynamics} from "../patching/patchdynamics";
 import {patchMethodCalls} from "../patching/patchmethodcalls";
 import {finalizeCallEdges} from "./finalization";
+import {applyPendingForceIncludes} from "./callEdgePriors";
 import {ProcessManager} from "../approx/processmanager";
 import {Patching} from "../approx/patching";
 import {PatchingDiagnostics} from "../approx/diagnostics";
@@ -100,6 +101,9 @@ export async function analyzeFiles(files: Array<string>, solver: Solver) {
                             // preprocess the AST
                             const moduleParams = preprocessAst(ast, moduleInfo);
 
+                            if (options.typesJson || options.shapeOf)
+                                a.shapePrograms.set(moduleInfo, ast);
+
                             // traverse the AST
                             writeStdOutIfActive("Traversing AST...");
                             visit(ast, new Operations(moduleInfo, solver, buildModuleNatives(solver, moduleInfo, moduleParams)));
@@ -116,6 +120,9 @@ export async function analyzeFiles(files: Array<string>, solver: Solver) {
                         ast.tokens = undefined; // tokens are no longer needed, allow GC
                     }
 
+                    // force_include: inject FunctionTokens for resolved include rules before propagate.
+                    // Idempotent (Priors.applied); callee/callsite that resolve in later batches fire on their batch's propagate.
+                    applyPendingForceIncludes(solver.fragmentState, solver);
                     // propagate tokens until fixpoint reached
                     await solver.propagate("Analyzing");
                     solver.updateDiagnostics();

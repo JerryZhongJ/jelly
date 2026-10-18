@@ -5,6 +5,7 @@ import {
     AssignmentExpression,
     AssignmentPattern,
     AwaitExpression,
+    BinaryExpression,
     CallExpression,
     Class,
     ClassAccessorProperty,
@@ -15,7 +16,10 @@ import {
     ClassPrivateProperty,
     ClassProperty,
     ConditionalExpression,
+    Expression,
     ExportAllDeclaration,
+    UnaryExpression,
+    UpdateExpression,
     ExportDefaultDeclaration,
     ExportNamedDeclaration,
     File,
@@ -25,6 +29,7 @@ import {
     FunctionExpression,
     Identifier,
     ImportDeclaration,
+    Node,
     isArrayPattern,
     isArrowFunctionExpression,
     isAssignmentPattern,
@@ -116,7 +121,7 @@ import {
     INTERNAL_PROTOTYPE,
     PROMISE_FULFILLED_VALUES
 } from "../natives/ecmascript";
-import {Operations} from "./operations";
+import {Operations, hasArithRule} from "./operations";
 import {TokenListener} from "./listeners";
 import {JELLY_NODE_ID} from "../parsing/extras";
 
@@ -293,7 +298,8 @@ export function visit(ast: File, op: Operations) {
                     // connect function object and its prototype object
                     const  pt = op.newPrototypeToken(fun);
                     solver.addTokenConstraint(pt, vp.objPropVar(ft, "prototype"));
-                    solver.addTokenConstraint(ft, vp.objPropVar(pt, "constructor"));
+                    const ctorVar = vp.objPropVar(pt, "constructor");
+                    solver.addTokenConstraint(ft, ctorVar);
                 }
 
                 if (fun.generator) {
@@ -378,6 +384,24 @@ export function visit(ast: File, op: Operations) {
                     // constraint: ⟦E⟧ ⊆ ⟦... = E⟧
                     if (!isParentExpressionStatement(path))
                         solver.addSubsetConstraint(eVar, vp.nodeVar(path.node));
+                } else if (oper === '+=') {
+
+                    // basic type inference: X += E behaves as X = X + E
+                    const lVar = op.expVar(path.node.left as Expression, path);
+                    if (lVar)
+                        op.registerArith('+', path.node.left as Node, path.node.left as Expression, path.node.right, path);
+                    if (!isParentExpressionStatement(path))
+                        op.registerArith('+', path.node, path.node.left as Expression, path.node.right, path);
+                } else if (oper.endsWith('=')) {
+
+                    // basic type inference: X op= E behaves as X = X op E (op arithmetic/bitwise):
+                    // the result labels follow from the operand labels (number vs bigint)
+                    const arithmeticOp = oper.slice(0, -1); // e.g. '-=' -> '-', '>>>=', -> '>>>'
+                    const lVar = op.expVar(path.node.left as Expression, path);
+                    if (lVar)
+                        op.registerArith(arithmeticOp, path.node.left as Node, path.node.left as Expression, path.node.right, path);
+                    if (!isParentExpressionStatement(path))
+                        op.registerArith(arithmeticOp, path.node, path.node.left as Expression, path.node.right, path);
                 }
             }
         },
@@ -388,6 +412,43 @@ export function visit(ast: File, op: Operations) {
                 // X = E (as default value)
                 // constraint: ⟦E⟧ ⊆ ⟦X⟧ (if X is a simple identifier...)
                 op.assign(op.expVar(path.node.right, path), path.node.left, path);
+            }
+        },
+
+        BinaryExpression: {
+            exit(path: NodePath<BinaryExpression>) {
+
+                // E1 + E2 (and the other arithmetic/bitwise/shift operators)
+
+                // basic type inference: result labels computed from the operand labels
+                // ('+' concatenates strings, the others follow ToNumeric/ToBigInt)
+                if (hasArithRule(path.node))
+                    op.registerArith(path.node.operator, path.node, path.node.left as Expression, path.node.right, path);
+            }
+        },
+
+        UnaryExpression: {
+            exit(path: NodePath<UnaryExpression>) {
+
+                // -E, ~E (the other unary operators have syntactic labels)
+
+                // basic type inference: result labels computed from the operand labels
+                // (number or bigint, depending on the operand)
+                if (hasArithRule(path.node))
+                    op.registerUnaryArith(path.node.operator, path.node, path.node.argument, path);
+            }
+        },
+
+        UpdateExpression: {
+            exit(path: NodePath<UpdateExpression>) {
+
+                // X++, ++X, X--, --X
+
+                // basic type inference: behaves as X = X + 1 / X = X - 1 (numeric add,
+                // never string concatenation): the result labels go to the expression
+                // and to the updated variable, following the operand labels
+                const xVar = op.expVar(path.node.argument, path);
+                op.registerUnaryArith(path.node.operator, path.node, path.node.argument, path, xVar);
             }
         },
 
@@ -458,7 +519,8 @@ export function visit(ast: File, op: Operations) {
                         if (rightvar)
                             if (isObjectProperty(path.node)) {
                                 // constraint: ⟦E⟧ ⊆ ⟦i.p⟧ where i is the object literal
-                                const dst = vp.objPropVar(op.newObjectToken(path.parentPath.node), key);
+                                const ot = op.newObjectToken(path.parentPath.node);
+                                const dst = vp.objPropVar(ot, key);
                                 solver.addSubsetConstraint(rightvar, dst);
                             } else {
                                 const cls = getClass(path);
